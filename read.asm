@@ -1,202 +1,244 @@
 ;-----------------------------------------------------------------------
 ; READ.COM -- Thai text reader, CGA / EGA / VGA / HGC, 8x19 font (8086)
 ;
-;   read file.txt [/v|/e|/c|/h]
+;   read file.txt [/v|/e|/c|/h]      read /t = selftest
 ;
 ;   keys:  Up/Dn = 1 line      PgUp/PgDn = page (Space/BS too)
 ;          Home/End = top/bottom
 ;          Left/Right = horizontal scroll 8 cols (long lines)
 ;          c = toggle Kaset-RW <-> TIS-620 decoding (live)
-;          q / Esc = quit
+;          F1 = help          q / Esc = quit
 ;
-; File is loaded into up to 8 x 64KB blocks (INT 21 AH=48),
-; a line table (seg:off per line) is built at lin_tab.
-; Assemble: nasm -f bin read.asm -o read.com
+; File is read into up to 8 x 64KB blocks at CS+1000h.. (contiguous, so a
+; line may run across a block edge), a line table (seg:off per line) is
+; built at lin_tab.  The font and the help text are stored run-length
+; packed and unpacked into the BSS at startup.
+;
+; Build: python build_read.py   (packs the data, runs NASM, strips the pad)
 ;-----------------------------------------------------------------------
-        cpu 8086
-        ; NOTE: NASM 3.02 (2026) IGNORES the 'org' directive in -f bin — the
-        ; image is emitted from address 0. We pad to 0100h instead and strip
-        ; the first 0x100 bytes after build (build_read.py does this), so
-        ; every label lands at its real DOS load address (file byte 0 -> CS:0100).
-        times 100h db 0
+        cpu     8086
+        ; NASM 3.x ignores 'org' in -f bin: pad to 0100h instead, the build
+        ; script strips the pad so every label = its real DOS load address.
+        times   100h db 0
 
-GDC     equ 3CEh
-LINEMAX equ 12288                    ; max lines (table lives 0x?000..0xF000)
-HELP_LINEMAX equ 256                 ; help table capacity (help doc is tiny)
-MAXBLK  equ 8
+%include "packed.inc"                ; FONT_LEN / HELP_LEN (from build_read.py)
+
 CELLH   equ 19                       ; cell height = font height (AXV 8x19)
+MAXBLK  equ 8
+HELP_LINEMAX equ 32                  ; help table capacity (help doc is tiny)
+VPARM_SZ equ 12
 
+; byte classes (cls table)
+C_TERM  equ 01h                      ; 00 0A 0D 1A
+C_SWAL  equ 02h                      ; invisible controls, eat nothing
+C_STYLE equ 04h                      ; WordStar style toggles
+C_COMB  equ 08h                      ; combining mark (upper or lower)
+
+; read next byte of the line: ES:SI -> AL = translated char, AH = class
+%macro  RDCH 0
+        mov     al, [es:si]
+        inc     si
+        jnz     %%ok
+        mov     bx, es               ; the line runs into the next block
+        add     bx, 1000h
+        mov     es, bx
+%%ok:   xor     ah, ah
+        mov     bx, ax
+        shl     bx, 1
+        mov     ax, [trc+bx]
+%endmacro
+
+;=======================================================================
 start:
         cld
-        ; flush stale keystrokes (e.g. the autoexec's Enter) so the
-        ; viewer's wait-for-key doesn't consume them and exit instantly
-fk1:
-        mov     ah, 1
+        mov     di, bss_start        ; ES = CS (DOS): zero the BSS
+        mov     cx, (bss_end-bss_start+1)/2
+        xor     ax, ax
+        rep     stosw
+        mov     si, packed           ; unpack font + help text:
+        mov     di, font8x19         ;   00 <n> <b> = run, else literal
+up_l:   lodsb
+        test    al, al
+        jz      up_run
+        stosb
+up_n:   cmp     di, help_data+HELP_LEN
+        jb      up_l
+        jmp     up_d
+up_run: lodsb
+        mov     cl, al
+        lodsb
+        rep     stosb
+        jmp     up_n
+up_d:
+        mov     si, cls_lo           ; byte class table: 00-1F and D1-EE
+        mov     di, cls
+        mov     cl, 20h
+        rep     movsb
+        mov     si, cls_hi
+        mov     di, cls+0D1h
+        mov     cl, 0EEh-0D1h+1
+        rep     movsb
+        mov     di, tbl_hi           ; pixel-doubling tables (expanded style)
+        xor     cx, cx
+        mov     bx, nib16
+tb_l:   mov     al, cl
+        push    cx
+        mov     cl, 4
+        shr     al, cl
+        pop     cx
+        xlat
+        mov     [di], al             ; tbl_hi[i] = high nibble doubled
+        mov     al, cl
+        and     al, 0Fh
+        xlat
+        mov     [di+256], al         ; tbl_lo[i] = low nibble doubled
+        inc     di
+        inc     cl
+        jnz     tb_l
+        mov     di, gofs             ; glyph offset table: font + 19*c
+        mov     ax, font8x19
+gf_l:   stosw
+        add     ax, CELLH
+        cmp     ax, font8x19+FONT_LEN
+        jb      gf_l
+        mov     word [lin_base], lin_tab
+        mov     word [lin_lim], LIN_LIM
+        ; flush stale keystrokes (e.g. the autoexec's Enter)
+fk1:    mov     ah, 1
         int     16h
         jz      fk2
         xor     ah, ah
         int     16h
         jmp     fk1
-fk2:
-        mov     ax, 0F00h            ; save current video mode
+fk2:    mov     ah, 0Fh              ; save current video mode
         int     10h
         mov     [old_mode], al
         call    parse_tail
         cmp     byte [forced], 0
         jne     m_set
         call    detect_video
-m_set:
-        call    gfx_on
+m_set:  call    gfx_on
         cmp     byte [test_mode], 0
         je      m_st
         call    clear_screen
         call    selftest
-        call    gfx_off
-        int     20h
-m_st:
-        mov     al, [text_rows]
-        dec     al
-        mov     [body], al           ; body rows = text_rows-1
-        call    clear_screen
-
-        cmp     byte [have_file], 0
-        je      demo_mode
-
-        call    load_file            ; CY=1 on error
+        jmp     v_quit
+m_st:   cmp     byte [have_file], 0
+        jne     m_file
+        call    enter_help           ; no file: show the help page
+        jmp     view_loop
+m_file: call    load_file            ; CY=1 on error
         jnc     m_ok
-        mov     di, status_buf
+        xor     al, al
+        call    set_row
         mov     si, s_err_open
-        call    scpy
+        call    puts
         mov     si, fname
-        call    scpy
-        mov     byte [di], ' '
-        inc     di
+        call    puts
         mov     si, s_errwd
-        call    scpy
+        call    puts
+        mov     di, numbuf
         mov     al, [open_err+1]
         call    hexdi
         mov     al, [open_err]
         call    hexdi
         mov     byte [di], 0
-        mov     byte [cur_row], 0
-        mov     byte [cur_col], 0
-        mov     byte [cell_has], 0
-        mov     si, status_buf
+        mov     si, numbuf
         call    puts
-        jmp     wait_exit
-m_ok:
-        call    detect_ku               ; auto-set code page from file content
+        xor     ax, ax               ; wait for a key, then quit
+        int     16h
+        jmp     v_quit
+m_ok:   call    detect_ku
         call    build_lines
         call    calc_limits
         jmp     view_loop
 
-; detect_ku: auto-set ku_mode by scanning the first 4KB of the loaded file.
-; KU files carry byte A3h or A5h over 2% of the scanned bytes; else TIS (raw).
+; detect_ku: KU files carry byte A3h or A5h over 2% of the first 4KB
 detect_ku:
-        push    ax
-        push    bx
-        push    cx
-        push    dx
-        push    si
-        push    di
-        push    es
-        mov     es, [blk_seg]
+        mov     bx, dk_tab           ; 1 = A3h, 2 = A5h, 3 = end of text
+        mov     byte [bx+0A3h], 1
+        mov     byte [bx+0A5h], 2
+        mov     byte [bx+000h], 3
+        mov     byte [bx+01Ah], 3
+        mov     es, [blk0]
         xor     si, si
-        xor     bx, bx                  ; A3h count
-        xor     di, di                  ; A5h count
+        xor     di, di               ; A3h count
+        xor     dx, dx               ; A5h count
         mov     cx, 4096
-dk_l:
-        mov     al, [es:si]
-        or      al, al
-        jz      dk_d
-        cmp     al, 1Ah
+dk_l:   es lodsb
+        xlat
+        test    al, al
+        jnz     dk_sp
+dk_n:   loop    dk_l
+        jmp     dk_d
+dk_sp:  cmp     al, 3
         je      dk_d
-        cmp     al, 0A3h
-        je      dk_a3
-        cmp     al, 0A5h
-        jne     dk_n
+        dec     al
+        jnz     dk_5
         inc     di
         jmp     dk_n
-dk_a3:
-        inc     bx
-dk_n:
-        inc     si
-        loop    dk_l
-dk_d:
-        mov     byte [ku_mode], 0       ; TIS
-        mov     ax, 4096
-        sub     ax, cx                  ; bytes scanned
-        mov     cx, 50
+dk_5:   inc     dx
+        jmp     dk_n
+dk_d:   mov     ax, 4096
+        sub     ax, cx               ; bytes scanned
+        mov     bx, dx
         xor     dx, dx
-        div     cx                      ; threshold = 2% of scanned
-        cmp     bx, ax
-        ja      dk_ku
+        mov     cx, 50
+        div     cx                   ; threshold = 2% of scanned
+        mov     cl, 1
         cmp     di, ax
-        ja      dk_ku
-        jmp     dk_e
-dk_ku:
-        mov     byte [ku_mode], 1
-dk_e:
+        ja      set_ku
+        cmp     bx, ax
+        ja      set_ku
+        dec     cx
+        ; fall through: AL = 0 = TIS
+
+; set_ku: CL = mode (0 TIS / 1 KU). Rebuilds trc: trc[b] = class<<8 | char
+set_ku: mov     [ku_mode], cl
+        push    es
+        push    ds
         pop     es
-        pop     di
-        pop     si
-        pop     dx
-        pop     cx
+        xor     bx, bx
+        mov     di, trc
+sk_l:   mov     al, bl
+        test    al, al
+        jns     sk_id                ; < 80h: never translated
+        cmp     byte [ku_mode], 0
+        je      sk_id
+        push    bx
+        mov     bx, ku_tab-80h
+        xlat
         pop     bx
-        pop     ax
+sk_id:  xor     ah, ah
+        mov     si, ax
+        mov     ah, [cls+si]
+        stosw
+        inc     bl
+        jnz     sk_l
+        pop     es
         ret
 
 ;---------------- help page (F1 / no parameter) -------------------------
-demo_mode:
-        call    enter_help
-        jmp     view_loop
-
-; enter_help: swap the viewer content to the embedded HELP.TXT document.
-; The help keeps its OWN line table (help_lin_tab), so the file's table
-; survives the visit and exit_help never has to rebuild it. The help table
-; is built lazily, once -- the embedded doc never changes.
+; The help keeps its OWN line table, built once; the file's table survives.
 enter_help:
         cmp     byte [help_mode], 0
         jne     eh_ret
-        mov     ax, [top]
-        mov     [sv_top], ax
-        mov     ax, [ku_mode]
-        mov     [sv_ku], ax
-        mov     ax, [hshift]
-        mov     [sv_hshift], ax
-        mov     ax, [nlines]
-        mov     [sv_nlines], ax
-        mov     ax, [maxlen]
-        mov     [sv_maxlen], ax
-        push    si
-        push    di
-        push    cx
-        push    es
-        mov     ax, cs
-        mov     es, ax
-        cld
-        mov     si, fname
-        mov     di, sv_fname
-        mov     cx, 66
-        rep     movsb
-        mov     si, blk_seg
-        mov     di, sv_blkseg
-        mov     cx, MAXBLK
-        rep     movsw
-        mov     al, [blk_used]
-        mov     [sv_blkused], al
+        push    ds
         pop     es
-        pop     cx
-        pop     di
-        pop     si
-        ; switch content to the help document
-        mov     ax, cs
-        mov     [blk_seg], ax        ; help bytes live in CS
-        mov     byte [blk_used], 1
+        mov     si, top              ; save top/hshift/nlines/maxlen/ku_mode
+        mov     di, sv_top
+        mov     cx, 5
+        rep     movsw
+        mov     [blk0], ds           ; help bytes live in CS
+        mov     ax, ds
+        add     ax, 1000h
+        mov     [blk_end], ax
         mov     word [hshift], 0
-        mov     byte [ku_mode], 0    ; help is TIS
+        xor     cx, cx
+        call    set_ku               ; help is TIS
         mov     word [lin_base], help_lin_tab
-        mov     word [lin_cap], HELP_LINEMAX
+        mov     word [lin_lim], help_lin_tab+HELP_LINEMAX*4
+        mov     ax, [help_nlines]
         cmp     byte [help_built], 0
         jne     eh_have
         mov     word [build_start], help_data
@@ -205,99 +247,66 @@ enter_help:
         mov     byte [help_built], 1
         mov     ax, [nlines]
         mov     [help_nlines], ax
-        jmp     eh_go
 eh_have:
-        mov     ax, [help_nlines]
         mov     [nlines], ax
-eh_go:
-        ; help has its own length: recompute the scroll clamp (topmax was
-        ; built for the file and must not bound -- or free-run -- the help)
-        mov     ax, [nlines]
-        mov     bl, [body]
-        xor     bh, bh
-        sub     ax, bx
-        jnc     eh_t1
-        xor     ax, ax
-eh_t1:
-        mov     [topmax], ax
+        call    calc_top
         mov     word [top], 0
         mov     byte [help_mode], 1
-eh_ret:
-        ret
+eh_ret: ret
 
-; exit_help: restore the saved view state. The file's line table was never
-; touched (the help uses its own), so no rebuild is needed.
 exit_help:
         cmp     byte [help_mode], 0
-        je      ex_ret
+        je      eh_ret
         mov     byte [help_mode], 0
-        mov     word [build_start], 0
-        mov     word [hshift], 0
-        push    si
-        push    di
-        push    cx
-        mov     ax, cs
-        add     ax, 1000h
-        mov     [blk_seg], ax
-        add     ax, 1000h
-        mov     [blk_seg+2], ax
-        add     ax, 1000h
-        mov     [blk_seg+4], ax
-        add     ax, 1000h
-        mov     [blk_seg+6], ax
-        add     ax, 1000h
-        mov     [blk_seg+8], ax
-        add     ax, 1000h
-        mov     [blk_seg+10], ax
-        add     ax, 1000h
-        mov     [blk_seg+12], ax
-        add     ax, 1000h
-        mov     [blk_seg+14], ax
-        mov     byte [blk_used], MAXBLK
-        mov     ax, [sv_top]
-        mov     [top], ax
-        mov     al, [sv_ku]
-        mov     [ku_mode], al
-        mov     ax, [sv_hshift]
-        mov     [hshift], ax
-        mov     ax, [sv_nlines]
-        mov     [nlines], ax
-        mov     ax, [sv_maxlen]
-        mov     [maxlen], ax
-        ; recompute the file scroll clamp (help ran with its own topmax)
-        mov     ax, [nlines]
-        mov     bl, [body]
-        xor     bh, bh
-        sub     ax, bx
-        jnc     ex_t1
-        xor     ax, ax
-ex_t1:
-        mov     [topmax], ax
-        mov     si, sv_fname
-        mov     di, fname
-        mov     cx, 66
-        rep     movsb
+        push    ds
+        pop     es
+        mov     si, sv_top
+        mov     di, top
+        mov     cx, 5
+        rep     movsw
+        call    set_blk
+        mov     cl, [ku_mode]
+        call    set_ku
+        call    calc_top
         mov     word [lin_base], lin_tab
-        mov     word [lin_cap], LINEMAX
-        pop     cx
-        pop     di
-        pop     si
-ex_ret:
+        mov     word [lin_lim], LIN_LIM
         ret
 
-; wait_exit: wait for a key, restore text mode, exit
-wait_exit:
+; set_blk: file buffers = CS+1000h .. CS+8FFFh
+set_blk:
+        mov     ax, cs
+        add     ax, 1000h
+        mov     [blk0], ax
+        add     ax, 8000h
+        mov     [blk_end], ax
+        ret
+
+; calc_top: topmax = max(nlines - body, 0)
+calc_top:
+        mov     ax, [nlines]
+        sub     al, [body]
+        sbb     ah, 0
+        jnc     ct1
         xor     ax, ax
-        int     16h
-        call    gfx_off
-        mov     ax, 4C00h
-        int     21h
+ct1:    mov     [topmax], ax
+        ret
+
+; calc_limits: topmax, top/hshift = 0, maxh = max(maxlen-80, 0)
+calc_limits:
+        call    calc_top
+        mov     word [top], 0
+        mov     word [hshift], 0
+        mov     ax, [maxlen]
+        sub     ax, 80
+        jnc     cl2
+        xor     ax, ax
+cl2:    mov     [maxh], ax
+        ret
 
 ;---------------- viewer -----------------------------------------------
 view_loop:
         call    redraw
-v_key:
-        xor     ax, ax
+v_key:  xor     ax, ax
         int     16h
         cmp     ah, 3Bh              ; F1 -> toggle help
         jne     v_nf1
@@ -308,1108 +317,804 @@ v_key:
 v_fback:
         call    exit_help
         jmp     view_loop
-v_nf1:
-        cmp     al, 0
-        jne     v_ascii
-        cmp     ah, 48h              ; Up
-        jne     v_dn
-        cmp     word [top], 0
-        je      v_key
-        mov     dx, [top]
-        mov     ax, dx
-        dec     ax
-        call    do_scroll
-        jc      view_loop
-        jmp     v_key
-v_dn:
-        cmp     ah, 50h              ; Down
-        jne     v_pgup
-        mov     dx, [top]
-        mov     ax, dx
-        inc     ax
-        cmp     ax, [topmax]
-        ja      v_key
-        call    do_scroll
-        jc      view_loop
-        jmp     v_key
-v_pgup:
-        cmp     ah, 49h              ; PgUp
-        jne     v_pgdn
-        mov     dx, [top]
-        mov     ax, dx
-        mov     bl, [body]
-        xor     bh, bh
-        sub     ax, bx
-        jnc     vpu1
-        xor     ax, ax
-vpu1:
-        call    do_scroll
-        jc      view_loop
-        jmp     v_key
-v_pgdn:
-        cmp     ah, 51h              ; PgDn
-        jne     v_home
-        mov     dx, [top]
-        mov     ax, dx
-        mov     bl, [body]
-        xor     bh, bh
-        add     ax, bx
-        cmp     ax, [topmax]
-        jbe     vpd1
-        mov     ax, [topmax]
-vpd1:
-        call    do_scroll
-        jc      view_loop
-        jmp     v_key
-v_home:
-        cmp     ah, 47h              ; Home
-        jne     v_end
-        mov     word [top], 0
-        jmp     view_loop
-v_end:
-        cmp     ah, 4Fh              ; End
-        jne     v_left
-        mov     ax, [topmax]
-        mov     [top], ax
-        jmp     view_loop
-v_left:
-        cmp     ah, 4Bh              ; Left
-        jne     v_right
-        cmp     word [hshift], 0
-        je      v_key
-        sub     word [hshift], 8     ; scroll 8 columns per press
-        jnc     v_left1
-        mov     word [hshift], 0
-v_left1:
-        jmp     view_loop
-v_right:
-        cmp     ah, 4Dh              ; Right
-        jne     v_key
-        mov     ax, [maxh]
-        cmp     word [hshift], ax
-        jae     v_key
-        add     word [hshift], 8     ; scroll 8 columns per press
-        cmp     word [hshift], ax
-        jbe     v_right1
-        mov     [hshift], ax
-v_right1:
-        jmp     view_loop
-
+v_nf1:  test    al, al
+        jnz     v_ascii
+        mov     al, ah               ; extended key: scan code | 80h
+        or      al, 80h
+        jmp     v_look
 v_ascii:
         cmp     byte [help_mode], 0
-        je      va_file
+        je      v_a2
         cmp     byte [have_file], 0
         je      v_quit               ; demo help: any key quits
-        call    exit_help            ; else: back to the file
-        jmp     view_loop
-va_file:
-        cmp     al, 'q'
-        je      v_quit
-        cmp     al, 'Q'
-        je      v_quit
-        cmp     al, 1Bh              ; Esc
-        je      v_quit
-        cmp     al, 'c'              ; toggle KU decoding
-        je      v_ku
-        cmp     al, 'C'
-        je      v_ku
-        cmp     al, ' '              ; Space = PgDn
-        je      v_sp
-        cmp     al, 08h              ; BS = PgUp
-        je      v_bs
-        cmp     al, 'r'              ; R = full redraw (screen may lag
-        je      v_redraw             ; behind at very fast scrolling)
-        cmp     al, 'R'
-        je      v_redraw
-        jmp     v_key
-v_redraw:
-        jmp     view_loop
-v_ku:
-        xor     byte [ku_mode], 1
-        jmp     view_loop
-v_sp:
-        mov     dx, [top]
-        mov     ax, dx
-        mov     bl, [body]
-        xor     bh, bh
-        add     ax, bx
-        cmp     ax, [topmax]
-        jbe     vsp1
-        mov     ax, [topmax]
-vsp1:
-        call    do_scroll
-        jc      view_loop
-        jmp     v_key
-v_bs:
-        mov     dx, [top]
-        mov     ax, dx
-        mov     bl, [body]
-        xor     bh, bh
-        sub     ax, bx
-        jnc     vbs1
-        xor     ax, ax
-vbs1:
-        call    do_scroll
-        jc      view_loop
-        jmp     v_key
-
-;---------------- partial scroll (VRAM blit) ----------------------------
-; do_scroll: AX = new top, DX = old top. Moves the overlapping body rows
-; within VRAM and redraws only the exposed rows + status bar. Returns
-; CF=1 when the change is too large for a blit (caller does a full redraw).
-do_scroll:
-        push    bx
-        push    cx
-        push    si
-        push    di
-        mov     [top], ax           ; commit the new top (both paths)
-        mov     di, ax              ; DI = new top (scroll_body preserves DI)
-        mov     si, ax
-        sub     si, dx              ; SI = delta (signed)
-        jz      ds_same
-        mov     ax, si
-        test    ax, ax
-        jns     ds_a
-        neg     ax
-ds_a:
-        mov     cl, [body]
-        xor     ch, ch
-        cmp     ax, cx
-        jae     ds_full
-        mov     [sb_delta], si
-        call    scroll_body
-        test    si, si
-        js      ds_up
-        ; content moved up: expose + redraw the LAST body row
-        mov     al, [body]
-        xor     ah, ah
-        add     di, ax
-        dec     di                  ; line index of the last row
-        mov     ax, [body]
-        xor     ah, ah
-        mov     cx, 19
-        mul     cx                  ; AX = first exposed scanline
-        mov     cx, 19
-        mov     bx, di              ; keep the line index
-        call    erase_rows
-        mov     al, [body]
-        mov     [dl_row], al
-        mov     ax, bx
-        call    set_line
-        call    draw_line
-        jmp     ds_st
-ds_up:
-        ; content moved down: expose + redraw the FIRST body row
-        mov     cx, si
-        neg     cx
-        mov     ax, cx
-        mov     bx, 19
-        mul     bx                  ; AX = |delta| * 19
-        mov     cx, ax
-        mov     ax, 19              ; first exposed scanline
-        call    erase_rows
-        mov     byte [dl_row], 1
-        mov     ax, di
-        call    set_line
-        call    draw_line
-ds_st:
-        call    st_refresh
-        clc
-        jmp     ds_out
-ds_full:
-        stc
-        jmp     ds_out
-ds_same:
-        clc
-ds_out:
-        pop     di
-        pop     si
-        pop     cx
-        pop     bx
-        ret
-
-; line_di: AX = scanline -> DI = VRAM offset of (AX,[pg_x])
-;   planar (VGA/EGA): y*row_bytes ; interleaved (CGA/HGC): vrow_tab LUT
-line_di:
-        push    bx
-        cmp     word [planar], 0
-        je      ld_i
-        mov     di, ax
-        shl     di, 1
-        shl     di, 1
-        shl     di, 1
-        shl     di, 1           ; *16
+        jmp     v_fback              ; else: back to the file
+v_a2:   cmp     al, 'A'
+        jb      v_look
+        or      al, 20h
+v_look: push    ds
+        pop     es
+        mov     di, keytab
+        mov     cx, KEYN
+        repne   scasb
+        jne     v_key
         mov     bx, di
-        shl     di, 1
-        shl     di, 1           ; *64
-        add     di, bx          ; *row_bytes (80)
-        jmp     ld_x
-ld_i:
-        mov     bx, ax
+        sub     bx, keytab+1
         shl     bx, 1
-        mov     di, [vrow_tab+bx]
-ld_x:
-        mov     ax, [pg_x]
-        shr     ax, 1
-        shr     ax, 1
-        shr     ax, 1
-        add     di, ax
-        pop     bx
-        ret
+        jmp     [keyhnd+bx]
 
-; scroll_body: move the body text rows within VRAM by sb_delta lines.
-; caller guarantees |sb_delta| < body.
-scroll_body:
-        push    ax
-        push    bx
-        push    cx
-        push    dx
-        push    si
-        push    di
-        push    es
-        push    ds
-        mov     es, [vseg]          ; never trust the caller's ES: draw_line
-        mov     ax, [sb_delta]      ; can leave it at the file segment
-        mov     cl, 19
-        imul    cl                  ; AX = delta * 19 scanlines (signed)
-        mov     dx, ax
-        mov     ax, [sb_delta]
-        test    ax, ax
-        jns     sc_a
-        neg     ax
-sc_a:
-        mov     cl, [body]
-        xor     ch, ch
-        sub     cx, ax              ; CX = (body - |delta|) rows to move
-        jcxz    sc_x
-        mov     al, cl
-        mov     cl, 19
-        mul     cl                  ; AX = scanline count
-        mov     bx, ax              ; BX = loop counter (rep movsb spares BX)
-        mov     bp, 19              ; first src scanline
-        test    dx, dx
-        jns     sc_f
-        ; content moves down: copy backward from the last pair
-        add     bp, bx
-        dec     bp                  ; last src line
-        std
-        jmp     sc_l
-sc_f:
-        add     bp, dx              ; first src = 19 + delta*19
-        cld
-sc_l:
-        mov     word [pg_x], 0
-        mov     ax, bp              ; src line
-        call    line_di
-        mov     si, di              ; SI = src offset
-        mov     ax, bp
-        sub     ax, dx              ; dst line = src - delta*19
-        call    line_di             ; DI = dst offset
-        mov     cx, [row_bytes]
-        cmp     word [sb_delta], 0
-        jns     sc_mv
-        dec     cx                  ; backward copy: align windows at the
-        add     si, cx              ; line END, else rep movsb writes
-        add     di, cx              ; the previous scanline's window
-        inc     cx
-sc_mv:
-        push    es
-        pop     ds                  ; DS = ES = vseg
-        rep     movsb
-        push    cs
-        pop     ds                  ; restore DS = CS
-        cmp     word [sb_delta], 0
-        jns     sc_n
-        dec     bp
-        jmp     sc_l2
-sc_n:
-        inc     bp
-sc_l2:
-        dec     bx
-        jnz     sc_l
-sc_x:
-        cld                     ; undo std (backward copy) - rest of the
-        pop     ds              ; program assumes forward string ops
-        pop     es
-        pop     di
-        pop     si
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        ret
-
-; erase_rows: fill CX scanlines starting at scanline AX with black
-erase_rows:
-        push    ax
-        push    cx
-        push    di
-        push    es
-        jcxz    er_d
-        mov     word [pg_x], 0
-        mov     es, [vseg]
-er1:
-        push    cx
-        push    ax
-        call    line_di
-        xor     al, al
-        mov     cx, [row_bytes]
-        rep     stosb
-        pop     ax
-        pop     cx
+k_up:   mov     ax, [top]
+        dec     ax
+        jmp     k_scroll
+k_dn:   mov     ax, [top]
         inc     ax
-        loop    er1
-er_d:
-        pop     es
-        pop     di
-        pop     cx
-        pop     ax
-        ret
+        jmp     k_scroll
+k_pu:   mov     ax, [top]
+        sub     al, [body]
+        sbb     ah, 0
+        jmp     k_scroll
+k_pd:   mov     ax, [top]
+        add     al, [body]
+        adc     ah, 0
+        jmp     k_scroll
+k_home: xor     ax, ax
+        jmp     k_scroll
+k_end:  mov     ax, [topmax]
+k_scroll:
+        call    do_scroll
+        jmp     v_key
+k_left: mov     ax, [hshift]
+        test    ax, ax
+        jz      v_key
+        sub     ax, 8                ; scroll 8 columns per press
+        jnc     k_hs
+        xor     ax, ax
+        jmp     k_hs
+k_right:
+        mov     ax, [hshift]
+        cmp     ax, [maxh]
+        jae     v_key
+        add     ax, 8
+        cmp     ax, [maxh]
+        jbe     k_hs
+        mov     ax, [maxh]
+k_hs:   mov     [hshift], ax
+        jmp     view_loop
+k_ku:   mov     cl, [ku_mode]        ; toggle KU decoding
+        xor     cl, 1
+        call    set_ku
+        jmp     view_loop
 
-; set_line: AX = line index (0-based) -> dl_seg / dl_off
-set_line:
-        push    bx
-        push    si
-        shl     ax, 1
-        shl     ax, 1
-        mov     bx, ax
-        mov     si, [lin_base]
-        mov     ax, [si+bx]
-        mov     [dl_seg], ax
-        mov     ax, [si+bx+2]
-        mov     [dl_off], ax
-        pop     si
-        pop     bx
-        ret
-
-v_quit:
-        mov     si, 0
-vq_l:
-        cmp     si, [blk_used]
-        jae     vq_done
-        mov     bx, si
-        shl     bx, 1
-        mov     es, [blk_seg+bx]
-        mov     ah, 49h
-        int     21h
-        inc     si
-        jmp     vq_l
-vq_done:
-        call    gfx_off
+v_quit: call    gfx_off
         mov     ax, 4C00h
         int     21h
 
-;---------------- screen redraw ----------------------------------------
-redraw:
-        call    clear_screen
-        mov     byte [dl_row], 1        ; body starts below the status row
-rd_lines:
-        mov     al, [dl_row]
-        cmp     al, [body]              ; body rows drawn (1..body), all fit
-        ja      rd_sep
-        mov     al, [dl_row]
-        dec     al                      ; screen row 1 = file line 0
+;---------------- scrolling --------------------------------------------
+; do_scroll: AX = wanted top (signed, unclamped). Blits the overlapping
+; body rows within VRAM and redraws only the exposed rows + status digits;
+; a change of a page or more is a full redraw.
+do_scroll:
+        test    ax, ax
+        jns     ds_a
+        xor     ax, ax
+ds_a:   cmp     ax, [topmax]
+        jbe     ds_b
+        mov     ax, [topmax]
+ds_b:   mov     dx, ax
+        sub     dx, [top]            ; DX = delta (signed)
+        jz      ds_ret
+        mov     [top], ax
+        mov     [sb_delta], dx
+        mov     ax, dx
+        jns     ds_c
+        neg     ax
+ds_c:   mov     cl, [body]
+        xor     ch, ch
+        cmp     ax, cx
+        jb      ds_blit
+        jmp     redraw               ; a page or more: full redraw
+ds_blit:
+        mov     cx, ax               ; CX = |delta| = exposed rows
+        mov     al, 1                ; content moved down: rows 1..|delta|
+        test    dx, dx
+        js      ds_d
+        mov     al, [body]           ; moved up: the last |delta| rows
+        sub     al, cl
+        inc     al
+ds_d:   push    ax
+        push    cx
+        call    scroll_body
+        pop     cx
+        pop     ax
+        call    draw_rows
+        jmp     st_refresh
+ds_ret: ret
+
+; scroll_body: move the body rows by [sb_delta] lines (|delta| < body),
+; one scanline at a time through the vrow_tab LUT (works in every mode).
+scroll_body:
+        mov     al, [body]
         xor     ah, ah
+        sub     ax, cx               ; rows to move
+        mov     cl, CELLH
+        mul     cl                   ; AX = scanlines to move
+        mov     cx, ax
+        mov     ax, [sb_delta]
+        mov     dl, CELLH
+        imul    dl                   ; AX = delta*19 (signed)
+        shl     ax, 1                ; *2: vrow_tab index delta
+        mov     bp, CELLH*2          ; dst = row 1, src = row 1+delta
+        mov     bx, bp
+        add     bx, ax
+        mov     dx, 2                ; ascending
+        test    ax, ax
+        jns     sb_go
+        mov     bx, cx               ; moving down: start from the last line
+        dec     bx
+        shl     bx, 1
+        add     bx, CELLH*2          ; src = last moved line
+        mov     bp, bx
+        sub     bp, ax               ; dst = src + |delta|*19
+        mov     dx, -2               ; descending
+sb_go:  mov     es, [vseg]
+        push    ds
+        mov     ds, [vseg]
+sb_l:   mov     si, [cs:vrow_tab+bx]
+        mov     di, [vrow_tab+bp]    ; (SS = CS)
+        push    cx
+        mov     cx, [cs:row_bytes]
+        shr     cx, 1
+        rep     movsw
+        pop     cx
+        add     bx, dx
+        add     bp, dx
+        loop    sb_l
+        pop     ds
+        ret
+
+; draw_rows: draw screen rows AL .. AL+CL-1
+draw_rows:
+        push    ax
+        push    cx
+        call    draw_row
+        pop     cx
+        pop     ax
+        inc     al
+        loop    draw_rows
+        ret
+
+; draw_row: draw file line [top]+AL-1 on screen row AL (if it exists)
+draw_row:
+        mov     [dl_row], al
+        xor     ah, ah
+        dec     ax
         add     ax, [top]
         cmp     ax, [nlines]
-        jae     rd_sep
-        call    set_line
-        call    draw_line
-        inc     byte [dl_row]
-        jmp     rd_lines
-rd_sep:
-        call    st_refresh
-        ret
+        jb      dr_ok
+        mov     al, [dl_row]         ; past the end: blank row
+        call    set_row
+        xor     bp, bp
+        mov     dx, [row_bytes]
+        jmp     dl_blank
+dr_ok:
+        shl     ax, 1
+        shl     ax, 1
+        add     ax, [lin_base]
+        mov     bx, ax
+        mov     ax, [bx]
+        mov     [dl_seg], ax
+        mov     ax, [bx+2]
+        mov     [dl_off], ax
+        jmp     draw_line
 
-; vband: fill rows 0..CELLH-1 solid white (inverse status band)
-vband:
-        cmp     word [planar], 0
-        je      vb_il
-        mov     ax, 0A000h
-        mov     es, ax
-        xor     di, di
-        mov     cx, CELLH
-        mov     bx, [row_bytes]
-        mov     al, 0FFh
-        cld
-vb_p:
-        push    cx
-        mov     cx, bx
-        rep     stosb
-        pop     cx
-        loop    vb_p
-        ret
-vb_il:
-        mov     es, [vseg]
-        xor     ax, ax
-vb_i1:
-        push    ax
-        mov     [pg_y], ax
-        mov     word [pg_x], 0
-        call    il_off
-        mov     al, 0FFh
-        mov     cx, [row_bytes]
-        rep     stosb
-        pop     ax
-        inc     ax
-        cmp     ax, CELLH
-        jb      vb_i1
-        ret
+;---------------- screen redraw ----------------------------------------
+redraw: mov     byte [r_len], 0      ; forces a full status bar
+        mov     al, 1                ; body starts below the status row
+        mov     cl, [body]
+        call    draw_rows
+        ; fall through into st_refresh (r_len = 0 forces the full bar)
 
-; rd_build: build the status string in status_buf and record the byte span
-;           and column span of the R: digits (the only part that changes
-;           while scrolling).
-rd_build:
+;---------------- status bar -------------------------------------------
+; st_refresh: repaint only the R: digits when their length is unchanged
+; (band columns + glyphs of that span), otherwise the whole bar.
+st_refresh:
+        call    fmt_digits           ; numbuf = "a-b", AL = length
+        cmp     al, [r_len]
+        jne     st_full
+        mov     bl, [r_c0]
+        xor     bh, bh
+        mov     bp, bx               ; first byte column of the digits
+        cbw
+        mov     dx, ax               ; byte count
+        call    vband                ; white band across the digit span
+        call    st_begin
+        mov     al, [r_c0]
+        mov     [cur_col], al
+        mov     si, numbuf
+        call    puts
+st_end: mov     byte [inv_flag], 0
+        ret
+st_full:
+        mov     [r_len], al
+        xor     bp, bp
+        mov     dx, [row_bytes]
+        call    vband
+        call    st_begin
+        mov     byte [cur_col], 0
+        mov     si, st_tpl
+        call    puts_tpl
+        ; ---- right-aligned hint block (bold codes are invisible) ----
+        mov     si, stl_right
+        xor     cx, cx
+rs_len: lodsb
+        test    al, al
+        jz      rs_d
+        cmp     al, 02h
+        je      rs_len
+        inc     cx
+        jmp     rs_len
+rs_d:   mov     al, [text_cols]
+        sub     al, cl
+        mov     [cur_col], al
+        mov     si, stl_right
+        call    puts
+        jmp     st_end
+
+; st_begin: inverse text at row 0
+st_begin:
+        mov     byte [inv_flag], 0FFh
         mov     byte [style_reg], 0
-        mov     di, status_buf
-        mov     byte [di], 02h          ; <b>
-        inc     di
+        xor     al, al
+        jmp     set_row
+
+; vband: white band rows 0..CELLH-1, byte columns [BP, BP+DX)
+vband:  xor     bx, bx
+        mov     cx, CELLH
+        mov     al, 0FFh
+        ; fall through
+; fill_rows: fill CX scanlines from vrow_tab index BX (=2*y) with byte AL,
+;            byte columns [BP, BP+DX)
+fill_rows:
+        mov     es, [vseg]
+        mov     ah, al
+fr_l:   mov     di, [vrow_tab+bx]
+        add     di, bp
+        push    cx
+        mov     cx, dx
+        shr     cx, 1
+        rep     stosw
+        jnc     fr_1
+        stosb
+fr_1:   pop     cx
+        inc     bx
+        inc     bx
+        loop    fr_l
+        ret
+
+; puts_tpl: like puts, but 01h = file name, 03h = hshift, 04h = R digits
+;           (records their column), 06h = KU/TIS label
+puts_tpl:
+        lodsb
+        test    al, al
+        jz      pt_ret
+        cmp     al, 01h
+        jne     pt_2
+        push    si
         mov     si, fname
-        call    scpy
-        mov     byte [di], 02h          ; </b>
-        inc     di
-        mov     byte [di], ' '
-        inc     di
-        mov     byte [di], 02h
-        inc     di
-        mov     byte [di], 'C'
-        inc     di
-        mov     byte [di], ':'
-        inc     di
-        mov     byte [di], 02h
-        inc     di
+pt_p:   call    puts
+        pop     si
+        jmp     puts_tpl
+pt_2:   cmp     al, 03h
+        jne     pt_3
+        push    si
         mov     ax, [hshift]
+        mov     di, numbuf
         call    dec_word
-        mov     byte [di], ' '
-        inc     di
-        mov     byte [di], 02h
-        inc     di
-        mov     byte [di], 'R'
-        inc     di
-        mov     byte [di], ':'
-        inc     di
-        mov     byte [di], 02h
-        inc     di
-        mov     ax, di
-        sub     ax, status_buf
-        mov     [r_b0], ax              ; R digits start here (relative index)
+        mov     byte [di], 0
+pt_n:   mov     si, numbuf
+        jmp     pt_p
+pt_3:   cmp     al, 04h
+        jne     pt_4
+        mov     al, [cur_col]
+        mov     [r_c0], al
+        push    si
+        call    fmt_digits
+        jmp     pt_n
+pt_4:   cmp     al, 06h
+        jne     pt_5
+        push    si
+        mov     si, sw_tis
+        cmp     byte [ku_mode], 0
+        je      pt_p
+        mov     si, sw_ku
+        jmp     pt_p
+pt_5:   call    draw_char
+        jmp     puts_tpl
+pt_ret: ret
+
+; fmt_digits: numbuf = "<top+1>-<last row>", AL = length
+fmt_digits:
+        mov     di, numbuf
         mov     ax, [top]
         inc     ax
         call    dec_word
         mov     byte [di], '-'
         inc     di
         mov     ax, [top]
-        mov     bl, [body]
-        xor     bh, bh
-        add     ax, bx                 ; 1-based last row on screen (rows 1..body)
+        add     al, [body]
+        adc     ah, 0                ; 1-based last row on screen
         cmp     ax, [nlines]
-        jbe     rs_bd
-        mov     ax, [nlines]           ; clamp at end of file
-rs_bd:
-        call    dec_word
-        mov     ax, di
-        sub     ax, status_buf
-        mov     [r_b1], ax              ; R digits end here (relative index)
-        mov     byte [di], ' '
-        inc     di
-        mov     byte [di], 02h
-        inc     di
-        cmp     byte [ku_mode], 0
-        je      rs_tis
-        mov     si, sw_ku
-        jmp     rs_ku1
-rs_tis:
-        mov     si, sw_tis
-rs_ku1:
-        mov     al, [si]
-        or      al, al
-        jz      rs_kud
-        mov     [di], al
-        inc     si
-        inc     di
-        jmp     rs_ku1
-rs_kud:
-        mov     byte [di], 02h
-        inc     di
+        jbe     fd1
+        mov     ax, [nlines]         ; clamp at end of file
+fd1:    call    dec_word
         mov     byte [di], 0
-        ; ---- column of the R span: count visible glyphs before it ----
-        mov     si, status_buf
-        xor     dx, dx
-rs_cc:
-        mov     ax, si
-        sub     ax, status_buf
-        cmp     ax, [r_b0]
-        jae     rs_ccd
-        mov     al, [si]
-        cmp     al, 02h
-        je      rs_cc1
-        call    is_comb
-        jc      rs_cc1
-        inc     dx
-rs_cc1:
-        inc     si
-        jmp     rs_cc
-rs_ccd:
-        mov     [r_c0], dx
-        mov     ax, [r_b1]
-        sub     ax, [r_b0]
-        add     ax, dx
-        mov     [r_c1], ax
-        ret
-
-; st_refresh: repaint the status bar only as far as needed. Compares the
-; fresh string with the shadow: identical -> leave the band pixels alone;
-; changed only inside the R: digit span -> repaint band columns and glyphs
-; of that span; anything else -> full band + full text.
-st_refresh:
-        push    ax
-        push    bx
-        push    cx
-        push    dx
-        push    si
-        push    di
-        call    rd_build
-        mov     si, status_buf
-        mov     di, status_shadow
-        xor     bl, bl                  ; bit0 = inside diff, bit1 = outside
-st_cmp:
-        mov     al, [si]
-        mov     ah, [di]
-        cmp     al, ah
-        je      st_c1
-        push    si
-        sub     si, status_buf
-        cmp     si, [r_b0]
-        pop     si
-        jb      st_cout
-        push    si
-        sub     si, status_buf
-        cmp     si, [r_b1]
-        pop     si
-        jae     st_cout
-        or      bl, 1
-        jmp     st_c2
-st_cout:
-        or      bl, 2
-        jmp     st_c3
-st_c1:
-        or      al, al
-        jz      st_c3
-st_c2:
-        inc     si
-        inc     di
-        jmp     st_cmp
-st_c3:
-        test    bl, 2
-        jnz     st_full
-        test    bl, 1
-        jnz     st_part
-        jmp     st_done                 ; identical: pixels already correct
-st_part:
-        ; clear the digit columns, then redraw just the digits
-        mov     ax, [r_c1]
-        cmp     ax, [sh_rc1]
-        jae     st_p0
-        mov     ax, [sh_rc1]
-st_p0:
-        mov     dx, ax
-        mov     ax, [r_c0]
-        call    vband_cols
-        mov     byte [inv_flag], 1
-        mov     byte [cur_row], 0
-        mov     byte [cell_has], 0
-        mov     byte [style_reg], 0
-        mov     ax, [r_b1]
-        sub     ax, [r_b0]
-        mov     cx, ax
-        mov     si, status_buf
-        add     si, [r_b0]
-st_p2:
-        mov     ax, [r_c1]
-        sub     ax, cx                  ; col of this digit (cx counts down)
-        mov     [cur_col], al
-        lodsb
-        push    cx
-        call    draw_char
-        pop     cx
-        loop    st_p2
-        mov     byte [inv_flag], 0
-        call    st_shadow
-        mov     ax, [r_c1]
-        mov     [sh_rc1], ax
-        jmp     st_done
-st_full:
-        call    vband
-        mov     byte [inv_flag], 1
-        mov     byte [cur_row], 0
-        mov     byte [cur_col], 0
-        mov     byte [cell_has], 0
-        mov     byte [style_reg], 0
-        mov     si, status_buf
-        call    puts
-        ; ---- right-aligned hint block (visible length only) ----
-        mov     byte [style_reg], 0
-        xor     cx, cx
-        mov     si, stl_right
-rs_rlen:
-        mov     al, [si]
-        or      al, al
-        jz      rs_rlen_d
-        inc     si
-        cmp     al, 02h
-        je      rs_rlen             ; bold codes are invisible: don't count
-        inc     cx
-        jmp     rs_rlen
-rs_rlen_d:
-        mov     ax, [text_cols]
-        sub     ax, cx
-        mov     [cur_col], al
-        mov     byte [cur_row], 0
-        mov     si, stl_right
-        call    puts
-        mov     byte [inv_flag], 0
-        call    st_shadow
-        mov     ax, [r_c1]
-        mov     [sh_rc1], ax
-st_done:
-        pop     di
-        pop     si
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        ret
-
-; st_shadow: copy status_buf (with terminator) over the shadow
-st_shadow:
-        push    si
-        push    di
-        push    cx
-        push    es
-        push    cs
-        pop     es                  ; movsb targets DS memory, not VRAM --
-        mov     si, status_buf      ; ES may still be A000 from drawing
-        mov     di, status_shadow
-        mov     cx, 96
-st_s1:
-        movsb
-        cmp     byte [di-1], 0
-        loopne  st_s1
-        pop     es
-        pop     cx
-        pop     di
-        pop     si
-        ret
-
-; vband_cols: repaint the inverse band (all CELLH rows) but only across
-; columns [AX, DX) in pixels.
-vband_cols:
-        push    ax
-        push    bx
-        push    cx
-        push    dx
-        push    di
-        push    si
-        push    bp
-        push    es
-        mov     bp, ax              ; c0
-        mov     si, dx              ; c1
-        mov     ax, bp
-        shr     ax, 1
-        shr     ax, 1
-        shr     ax, 1
-        mov     bx, ax              ; first byte column
-        mov     ax, si
-        shr     ax, 1
-        shr     ax, 1
-        shr     ax, 1
-        sub     ax, bx              ; byte count
-        mov     dx, ax
-        cmp     word [planar], 0
-        je      vbc_il
-        mov     cx, CELLH
-        mov     ax, 0A000h
-        mov     es, ax
-        mov     di, bx
-        mov     al, 0FFh
-        cld
-vbc_p1:
-        push    cx
-        mov     cx, dx
-        jcxz    vbc_p2
-        rep     stosb
-vbc_p2:
-        pop     cx
-        add     di, [row_bytes]
-        loop    vbc_p1
-        jmp     vbc_d
-vbc_il:
-        mov     ax, bx
-        shl     ax, 1
-        shl     ax, 1
-        shl     ax, 1
-        mov     [pg_x], ax          ; il_off wants pixels
-        mov     es, [vseg]
-        xor     ax, ax              ; scanline 0
-        mov     bh, 0FFh
-vbc_i1:
-        push    ax
-        push    cx
-        call    il_off
-        mov     cx, dx
-        jcxz    vbc_i2
-        mov     al, bh
-        rep     stosb
-vbc_i2:
-        pop     cx
-        pop     ax
-        inc     ax
-        cmp     ax, CELLH
-        jb      vbc_i1
-vbc_d:
-        pop     es
-        pop     bp
-        pop     si
-        pop     di
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        ret
-
-; draw_line: render line [dl_seg]:[dl_off] at row [dl_row] with [hshift]
-draw_line:
-        mov     byte [style_reg], 0     ; styles are line-local: a line must
-        mov     byte [exp_prev], 0      ; render the same on blit or redraw
-        mov     al, [dl_row]
-        mov     [cur_row], al
-        mov     byte [cur_col], 0
-        mov     byte [cell_has], 0
-        mov     es, [dl_seg]
-        mov     si, [dl_off]
-        ; --- skip hshift columns (style-aware: style codes toggle the
-        ;     running style state and eat 0 columns, marks eat 0 columns,
-        ;     a base eats 1 column normally or 2 when expanded) ---
-        mov     cx, [hshift]
-        jcxz    dlsk_near
-        xor     dx, dx                 ; columns consumed
-        jmp     dlsk_l
-dlsk_near:
-        jmp     dl_skm
-dlsk_l:
-        mov     al, [es:si]
-        call    term_chk
-        jz      dl_done
-        call    ku_tr
-        cmp     al, 1Bh
-        je      dlsk_m                 ; WS escape: no columns
-        cmp     al, 02h
-        je      dlsk_t
-        cmp     al, 05h
-        je      dlsk_t
-        cmp     al, 0Eh
-        je      dlsk_t
-        cmp     al, 0Fh
-        je      dlsk_t
-        cmp     al, 12h
-        je      dlsk_t
-        cmp     al, 13h
-        je      dlsk_t
-        cmp     al, 14h
-        je      dlsk_t
-        cmp     al, 16h
-        je      dlsk_t
-        cmp     al, 17h
-        je      dlsk_t
-        cmp     al, 15h
-        je      dlsk_t                 ; 15h = italic too (RW files)
-        ; swallowed controls (match TREAD): invisible, eat nothing
-        cmp     al, 01h
-        je      dlsk_m
-        cmp     al, 03h
-        je      dlsk_m
-        cmp     al, 04h
-        je      dlsk_m
-        cmp     al, 06h
-        je      dlsk_m
-        cmp     al, 07h
-        je      dlsk_m
-        cmp     al, 1Ch
-        je      dlsk_m
-        cmp     al, 1Dh
-        je      dlsk_m
-        cmp     al, 1Eh
-        je      dlsk_m
-        cmp     al, 1Fh
-        je      dlsk_m
-        call    is_comb
-        jc      dlsk_m                 ; combining mark: no columns
-        inc     dx                     ; base char
-        inc     si                     ; advance past the base byte
-        test    byte [style_reg], 02h
-        jz      dlsk_chk
-        inc     dx                     ; expanded base = 2 columns
-dlsk_chk:
-        cmp     dx, [hshift]
-        jb      dlsk_l
-        jmp     dlsk_tm
-dlsk_t:
-        call    style_toggle
-        inc     si
-        jmp     dlsk_l
-dlsk_m:
-        inc     si
-        jmp     dlsk_l
-dlsk_tm:                        ; skip trailing marks of the last skipped base
-        mov     al, [es:si]
-        call    term_chk
-        jz      dl_done
-        call    ku_tr
-        call    is_comb
-        jnc     dl_go
-        inc     si
-        jmp     dlsk_tm
-dl_skm:                          ; hshift=0: skip leading combining marks
-        mov     al, [es:si]
-        cmp     al, 0Dh
-        je      dl_done
-        cmp     al, 0Ah
-        je      dl_done
-        cmp     al, 1Ah
-        je      dl_done
-        or      al, al
-        jz      dl_done
-        call    ku_tr
-        call    is_comb
-        jnc     dl_go
-        inc     si
-        jmp     dl_skm
-dl_go:
-        mov     cx, 255                 ; guard: max bytes per line (the
-        xor     ch, ch                  ; cur_col clamp handles columns --
-dl_l:                                   ; marks eat bytes, not columns
-        mov     al, [cur_col]
-        cmp     al, [text_cols]
-        jb      dl_c1
-        jmp     dl_ovf                  ; past right edge: draw marks only
-dl_c1:
-        mov     al, [es:si]
-        cmp     al, 0Dh
-        je      dl_done
-        cmp     al, 0Ah
-        je      dl_done
-        cmp     al, 1Ah
-        je      dl_done
-        or      al, al
-        jz      dl_done
-        call    ku_tr
-        ; --- fast path: plain base glyph with no style active. Bytes
-        ;     < 20h are controls/toggles/escapes, D1h-DBh and E7h-EEh are
-        ;     combining marks -- everything else renders identically to
-        ;     the full pipeline when style_reg=0, minus the cell_tmp
-        ;     copy, apply_style and dispatch overhead. ---
-        cmp     byte [style_reg], 0
-        jne     fg_slow
-        cmp     al, 20h
-        jb      fg_slow
-        cmp     al, 0D1h
-        jb      fg_go
-        cmp     al, 0DBh
-        jbe     fg_slow
-        cmp     al, 0E7h
-        jb      fg_go
-        cmp     al, 0EEh
-        jbe     fg_slow
-fg_go:
-        push    cx
-        push    di
-        push    es
-        mov     [chr], al
-        call    set_tall
-        push    si
-        xor     ah, ah
-        mov     bx, CELLH
-        mul     bx
-        add     ax, font8x19
-        mov     si, ax
-        mov     di, cell_buf
-        mov     cx, CELLH
-        push    es
-        push    cs
-        pop     es
-        rep     movsb                   ; cell_buf = font glyph
-        pop     es
-        pop     si
-        mov     byte [cell_upper], 0
-        mov     byte [back], 0
-        mov     al, [cur_col]
-        xor     ah, ah
-        shl     ax, 1
-        shl     ax, 1
-        shl     ax, 1
-        mov     [pg_x], ax
-        mov     al, [cur_row]
-        xor     ah, ah
-        mov     bx, ax
-        shl     ax, 1
-        shl     ax, 1
-        shl     ax, 1
-        shl     ax, 1
-        add     ax, bx
-        add     ax, bx
-        add     ax, bx                  ; *19
-        mov     [pg_y], ax
-        mov     ax, [scr_px]
-        sub     ax, 8
-        cmp     [pg_x], ax
-        jae     fg_d1
-        mov     word [pg_src], cell_buf
-        call    put_glyph
-fg_d1:
-        mov     byte [cell_has], 1
-        inc     byte [cur_col]
-        pop     es
-        pop     di
-        pop     cx
-        inc     si
-        dec     cx
-        jnz     dl_l
-        jmp     dl_done
-fg_slow:
-        push    cx
-        call    draw_char
-        pop     cx
-        inc     si
-        dec     cx
-        jnz     dl_l
-        jmp     dl_done
-dl_ovf:                                 ; mark-only mode past col 80
-        mov     al, [es:si]
-        call    term_chk
-        jz      dl_done
-        call    ku_tr
-        call    is_comb
-        jc      dl_ovm
-        inc     byte [cur_col]          ; off-screen base: count only
-        inc     si
-        jmp     dl_ovf
-dl_ovm:                                 ; mark: still drawn at col 79
-        call    draw_char
-        inc     si
-        jmp     dl_ovf
-dl_done:
-        ret
-
-; ku_tr: translate AL if KU mode and AL >= 80h
-ku_tr:
-        cmp     byte [ku_mode], 0
-        je      kt_ret
-        cmp     al, 80h
-        jb      kt_ret
-        push    bx
-        mov     bx, ku_tab-80h
-        xlat
-        pop     bx
-kt_ret:
-        ret
-
-; term_chk: ZF=1 if AL is a line terminator (0Dh 0Ah 1Ah 00h)
-term_chk:
-        cmp     al, 0Dh
-        je      tc_z
-        cmp     al, 0Ah
-        je      tc_z
-        cmp     al, 1Ah
-        je      tc_z
-        or      al, al
-tc_z:
-        ret
-
-; is_comb: CY=1 if AL is a combining mark (font code)
-is_comb:
-        cmp     al, 0D1h
-        je      ic_yes
-        cmp     al, 0D4h
-        jb      ic_no
-        cmp     al, 0DBh
-        jbe     ic_yes
-        cmp     al, 0E7h
-        jb      ic_no
-        cmp     al, 0EEh
-        jbe     ic_yes
-ic_no:
-        clc
-        ret
-ic_yes:
-        stc
-        ret
-
-; scpy: copy ASCIZ [SI] to [DI]
-scpy:
-        mov     al, [si]
-        or      al, al
-        jz      scpy_d
-        mov     [di], al
-        inc     si
-        inc     di
-        jmp     scpy
-scpy_d:
-        ret
-
-; hexdi: write AL as 2 hex chars at [DI]
-hexdi:
-        push    ax
-        push    cx
-        mov     cl, al
-        shr     al, 1
-        shr     al, 1
-        shr     al, 1
-        shr     al, 1
-        call    hexn
-        mov     al, cl
-        and     al, 0Fh
-        call    hexn
-        pop     cx
-        pop     ax
-        ret
-hexn:
-        cmp     al, 9
-        jbe     hn9
-        add     al, 'A'-10
-        jmp     hnst
-hn9:
-        add     al, '0'
-hnst:
-        mov     [di], al
-        inc     di
+        mov     ax, di
+        sub     ax, numbuf
         ret
 
 ; dec_word: write AX as decimal at [DI], advance DI
 dec_word:
-        push    ax
         push    bx
         push    cx
         push    dx
         mov     bx, 10
         xor     cx, cx
-dw1:
-        xor     dx, dx
+dw1:    xor     dx, dx
         div     bx
         push    dx
         inc     cx
-        or      ax, ax
+        test    ax, ax
         jnz     dw1
-dw2:
-        pop     dx
-        add     dl, '0'
-        mov     [di], dl
+dw2:    pop     ax
+        add     al, '0'
+        mov     [di], al
         inc     di
         loop    dw2
         pop     dx
         pop     cx
         pop     bx
+        ret
+
+; hexdi: write AL as 2 hex chars at [DI]
+hexdi:  push    ax
+        push    cx
+        mov     cl, 4
+        shr     al, cl
+        call    hexn
+        pop     cx
+        pop     ax
+        push    ax
+        and     al, 0Fh
+        call    hexn
         pop     ax
         ret
+hexn:   add     al, '0'
+        cmp     al, '9'
+        jbe     hn1
+        add     al, 'A'-'0'-10
+hn1:    mov     [di], al
+        inc     di
+        ret
+
+;---------------- line renderer ----------------------------------------
+; draw_line: render line [dl_seg]:[dl_off] at row [dl_row] with [hshift]
+draw_line:
+        mov     byte [style_reg], 0  ; styles are line-local
+        mov     byte [exp_prev], 0
+        mov     al, [dl_row]
+        call    set_row
+        mov     bx, [cur_y2]
+        mov     bx, [vrow_tab+bx]
+        mov     [dl_vrow], bx        ; VRAM offset of the row's first scanline
+        mov     byte [cur_col], 0
+        mov     byte [cell_has], 0
+        mov     es, [dl_seg]
+        mov     si, [dl_off]
+        mov     cx, [hshift]
+        jcxz    dl_skm
+        xor     dx, dx               ; columns consumed
+        ; --- skip hshift columns (style-aware: style codes toggle the
+        ;     running style and eat 0 columns, marks eat 0 columns,
+        ;     a base eats 1 column, or 2 when expanded) ---
+dl_sk:  RDCH
+        test    ah, C_TERM
+        jnz     dl_done
+        test    ah, C_STYLE
+        jz      dl_sk1
+        call    style_toggle
+        jmp     dl_sk
+dl_sk1: test    ah, C_SWAL|C_COMB
+        jnz     dl_sk
+        inc     dx
+        test    byte [style_reg], 02h
+        jz      dl_sk2
+        inc     dx                   ; expanded base = 2 columns
+dl_sk2: cmp     dx, cx
+        jb      dl_sk
+        ; skip the trailing marks of the last skipped base / leading marks
+dl_skm: call    peek
+        test    ah, C_TERM
+        jnz     dl_done
+        test    ah, C_COMB
+        jz      dl_go
+        call    adv
+        jmp     dl_skm
+dl_go:  mov     cl, 255              ; guard: max bytes per line
+        call    dl_fix               ; CH = fast path ok, dl_vdi = VRAM ptr
+dl_l:   mov     al, [cur_col]
+        cmp     al, [text_cols]
+        jae     dl_ovf               ; past the right edge: marks only
+        RDCH
+        test    ah, C_TERM
+        jnz     dl_done
+        test    ah, ah
+        jnz     dl_slow
+        test    ch, ch
+        jz      dl_slow
+        ; ---- fast path: plain base, no style, planar, not inverse:
+        ;      blit the font glyph straight to VRAM ----
+        push    si
+        push    es
+        mov     bx, ax               ; AH = class = 0
+        shl     bx, 1
+        mov     si, [gofs+bx]        ; glyph
+        mov     [cell_src], si       ; a following mark composes on it
+        mov     di, [dl_vdi]
+        mov     es, [vseg]
+%rep CELLH-1
+        movsb
+        add     di, 79
+%endrep
+        movsb
+        pop     es
+        pop     si
+        inc     word [dl_vdi]
+        inc     byte [cur_col]
+        mov     word [cell_has], 0001h   ; cell_has = 1, exp_prev = 0
+        dec     cl
+        jnz     dl_l
+dl_done:                             ; every cell up to cur_col was written:
+        mov     al, [text_cols]      ; blank the rest of the row
+        sub     al, [cur_col]
+        jbe     dl_ret
+        xor     ah, ah
+        mov     dx, ax
+        mov     al, [cur_col]
+        mov     bp, ax
+dl_blank:
+        mov     bx, [cur_y2]
+        mov     cx, CELLH
+        xor     al, al
+        jmp     fill_rows
+dl_ret: ret
+dl_slow:
+        call    draw_char_c
+        call    dl_fix
+        dec     cl
+        jnz     dl_l
+        jmp     dl_done
+
+; dl_fix: after a slow-path byte: CH = fast path allowed (planar and no
+;         style active), dl_vdi = VRAM address of the current cell
+dl_fix: mov     al, [cur_col]
+        xor     ah, ah
+        add     ax, [dl_vrow]
+        mov     [dl_vdi], ax
+        mov     ch, [planar]
+        cmp     byte [style_reg], 0
+        je      df_r
+        xor     ch, ch
+df_r:   ret
+dl_ovf: RDCH
+        test    ah, C_TERM
+        jnz     dl_done
+        test    ah, C_COMB
+        jz      dl_cnt
+        call    draw_char_c          ; mark: still drawn on the last cell
+        jmp     dl_ovf
+dl_cnt: cmp     byte [cur_col], 255  ; off-screen base: count only
+        je      dl_ovf               ; (saturate: the count must not wrap)
+        inc     byte [cur_col]
+        jmp     dl_ovf
+
+; peek: AL/AH = translated char/class at ES:SI (no advance)
+peek:   mov     al, [es:si]
+        xor     ah, ah
+        mov     bx, ax
+        shl     bx, 1
+        mov     ax, [trc+bx]
+        ret
+; adv: SI++ with block wrap
+adv:    inc     si
+        jnz     adv_r
+        mov     ax, es
+        add     ax, 1000h
+        mov     es, ax
+adv_r:  ret
+
+; style_toggle: apply style code AL to [style_reg]
+style_toggle:
+        xor     ah, ah
+        mov     bx, ax
+        mov     al, [stx+bx]         ; xor mask
+        test    al, 30h              ; sub/super clear each other
+        jz      st_x
+        mov     ah, al
+        xor     ah, 30h
+        not     ah
+        and     [style_reg], ah
+st_x:   xor     [style_reg], al
+        ret
+
+;---------------- text layer -------------------------------------------
+; puts: draw ASCIZ string [SI] at cur_row/cur_col
+puts:   mov     byte [cell_has], 0
+puts_j: lodsb
+        test    al, al
+        jz      puts_d
+        call    draw_char
+        jmp     puts_j
+puts_d: ret
+
+; set_row: AL = text row -> cur_row, cur_y2 (= row*19*2, vrow_tab index)
+set_row:
+        mov     [cur_row], al
+        xor     ah, ah
+        shl     ax, 1
+        mov     bx, ax
+        shl     ax, 1
+        add     bx, ax               ; 6r
+        shl     ax, 1
+        shl     ax, 1
+        shl     ax, 1                ; 32r
+        add     ax, bx               ; 38r
+        mov     [cur_y2], ax
+        ret
+
+;---------------- cell renderer ----------------------------------------
+; draw_char: AL = raw byte (not translated). Preserves SI, CX, ES.
+draw_char:
+        xor     ah, ah
+        mov     bx, ax
+        mov     ah, [cls+bx]
+; draw_char_c: AL = char, AH = class
+draw_char_c:
+        test    ah, C_STYLE
+        jnz     style_toggle
+        test    ah, C_SWAL|C_TERM
+        jnz     dc_ret               ; invisible, eats nothing
+        test    ah, C_COMB
+        jz      dc_base
+        cmp     byte [cell_has], 0
+        je      dc_base              ; mark with no base: draw as a base
+        ; ---- combining mark: OR into the current cell, redraw it ----
+        push    si
+        push    cx
+        push    es
+        push    ds
+        pop     es
+        mov     ah, [exp_prev]
+        inc     ah
+        mov     [back], ah           ; 1 normal, 2 after an expanded base
+        cmp     word [cell_src], cell_buf
+        je      dc_m1
+        push    ax
+        mov     si, [cell_src]       ; first mark: materialise the cell
+        mov     di, cell_buf
+        mov     cx, CELLH
+        rep     movsb
+        mov     word [cell_src], cell_buf
+        pop     ax
+dc_m1:  call    glyph_ptr
+        mov     di, cell_buf
+        mov     cx, CELLH/2
+dc_o:   lodsw
+        or      [di], ax
+        inc     di
+        inc     di
+        loop    dc_o
+        lodsb
+        or      [di], al
+        call    dc_draw
+        pop     es
+        pop     cx
+        pop     si
+dc_ret: ret
+
+; dc_base: AL = base char: draw it at cur_col, advance
+dc_base:
+        push    si
+        push    cx
+        push    es
+        call    glyph_ptr
+        mov     [cell_src], si
+        mov     byte [back], 0
+        call    dc_draw
+        pop     es
+        pop     cx
+        pop     si
+        mov     byte [cell_has], 1
+        inc     byte [cur_col]
+        mov     byte [exp_prev], 0
+        test    byte [style_reg], 02h
+        jz      dc_ret
+        mov     byte [exp_prev], 1   ; marks after this cell shift back by 2
+        inc     byte [cur_col]       ; expanded char occupies 2 columns
+        ret
+
+; glyph_ptr: AL = char -> SI = font glyph (19 bytes)
+glyph_ptr:
+        xor     ah, ah
+        mov     si, ax
+        shl     si, 1
+        mov     si, [gofs+si]
+        ret
+
+; dc_draw: draw cell [cell_src] at column cur_col-[back], row cur_row,
+;          with the current style; nothing is drawn beyond text_cols.
+dc_draw:
+        mov     al, [cur_col]
+        sub     al, [back]
+        jnc     dd1
+        xor     al, al
+dd1:    xor     ah, ah
+        mov     bp, ax               ; column = byte column
+        mov     bx, [cur_y2]
+        mov     si, [cell_src]
+        mov     dl, [inv_flag]
+        mov     ah, [style_reg]
+        test    ah, ah
+        jnz     dd_sty
+        cmp     al, [text_cols]
+        jae     dd_ret
+        jmp     put_glyph
+dd_sty: push    ax
+        push    ds
+        pop     es
+        mov     di, cell_tmp         ; cell_tmp = styled copy of the cell
+        mov     cx, CELLH
+        rep     movsb
+        mov     si, [cell_src]
+        call    apply_style
+        pop     ax
+        mov     bx, [cur_y2]
+        mov     si, cell_tmp
+        test    ah, 02h
+        jnz     dd_wide
+        cmp     al, [text_cols]
+        jae     dd_ret
+        jmp     put_glyph
+dd_wide:
+        mov     dh, [text_cols]
+        dec     dh
+        cmp     al, dh
+        ja      dd_ret
+        jmp     put_wide             ; DH = last column: right half only
+dd_ret: ret
+
+; apply_style: transform cell_tmp per AH = style_reg (SI = unstyled cell)
+apply_style:
+        test    ah, 01h              ; ---- bold
+        jz      as_shear
+        xor     bx, bx
+as_b1:  mov     al, [cell_tmp+bx]
+        shr     al, 1
+        or      [cell_tmp+bx], al
+        inc     bx
+        cmp     bl, CELLH
+        jb      as_b1
+as_shear:
+        test    ah, 40h              ; ---- italic shear (in-cell)
+        jz      as_sub
+        xor     bx, bx
+as_s1:  mov     cl, 2                ; rows 0-3 >>2, 4-11 >>1, 12-18 >>0
+        cmp     bl, 4
+        jb      as_s2
+        dec     cl
+        cmp     bl, 12
+        jb      as_s2
+        dec     cl
+as_s2:  shr     byte [cell_tmp+bx], cl
+        inc     bx
+        cmp     bl, CELLH
+        jb      as_s1
+as_sub: test    ah, 10h              ; ---- subscript: shift down 3
+        jz      as_sup
+        mov     bx, 15
+as_u1:  mov     al, [cell_tmp+bx]
+        mov     [cell_tmp+bx+3], al
+        dec     bx
+        jns     as_u1
+        mov     word [cell_tmp], 0
+        mov     byte [cell_tmp+2], 0
+as_sup: test    ah, 20h              ; ---- superscript: shift up 5
+        jz      as_ul
+        mov     bx, 5
+as_p1:  mov     al, [cell_tmp+bx]
+        mov     [cell_tmp+bx-5], al
+        inc     bx
+        cmp     bl, CELLH
+        jb      as_p1
+        mov     word [cell_tmp+14], 0
+        mov     word [cell_tmp+16], 0
+        mov     byte [cell_tmp+18], 0
+as_ul:  test    ah, 08h              ; ---- underline single
+        jz      as_ret
+        cmp     byte [si+17], 0      ; descender/lower-mark ink on the
+        jnz     as_ret               ; rule row: skip it
+        mov     byte [cell_tmp+17], 0FFh
+        test    ah, 04h              ; ---- underline double
+        jz      as_ret
+        cmp     byte [si+18], 0
+        jnz     as_ret
+        mov     byte [cell_tmp+18], 0FFh
+as_ret: ret
+
+; put_glyph: blit 19 rows [SI] at vrow_tab index BX, byte column BP,
+;            DL = 0 normal / FFh inverse. Clobbers AX CX DI ES.
+put_glyph:
+        mov     es, [vseg]
+        test    dl, dl
+        jnz     pg_lut
+        cmp     byte [planar], 0
+        je      pg_lut
+        mov     di, [vrow_tab+bx]    ; planar: 80 bytes per scanline
+        add     di, bp
+%rep CELLH-1
+        movsb
+        add     di, 79
+%endrep
+        movsb
+        ret
+pg_lut: mov     cx, CELLH            ; interleaved (or inverse): LUT per row
+pg_l:   mov     di, [vrow_tab+bx]
+        lodsb
+        xor     al, dl
+        mov     [es:bp+di], al
+        inc     bx
+        inc     bx
+        loop    pg_l
+        ret
+
+; put_wide: blit [SI] pixel-doubled (16 px wide); DH = last text column
+put_wide:
+        push    ds
+        pop     es
+        mov     di, cell_wide
+        mov     cx, CELLH
+        cmp     al, dh
+        mov     dx, bx               ; keep the vrow_tab index (BX -> tables)
+        je      pw_last
+pw_s:   lodsb                        ; stretch: 8 px -> 16 px
+        mov     ah, al
+        mov     bx, tbl_hi
+        xlat
+        stosb
+        mov     al, ah
+        mov     bx, tbl_lo
+        xlat
+        stosb
+        loop    pw_s
+        mov     bx, dx
+        mov     es, [vseg]
+        mov     si, cell_wide
+        mov     cx, CELLH
+pw_b:   mov     di, [vrow_tab+bx]
+        add     di, bp
+        movsw
+        inc     bx
+        inc     bx
+        loop    pw_b
+        ret
+pw_last:                             ; last column: left halves only
+        lodsb
+        mov     bx, tbl_hi
+        xlat
+        stosb
+        loop    pw_last
+        mov     bx, dx
+        mov     si, cell_wide
+        xor     dl, dl
+        jmp     put_glyph
 
 ;---------------- file load --------------------------------------------
 load_file:
@@ -1417,1496 +1122,451 @@ load_file:
         mov     dx, fname
         int     21h
         jnc     lf_ok
-        mov     [open_err], ax        ; real DOS error code for the status line
+        mov     [open_err], ax       ; real DOS error code for the status line
         stc
         ret
-lf_ok:
-        mov     [handle], ax
-        ; buffers at segments CS+1000h..CS+8000h (free RAM above our COM,
-        ; well clear of lin_tab at CS:29xx and the stack) - no DOS memory calls
-        mov     ax, cs
-        add     ax, 1000h
-        mov     word [blk_seg+0], ax
-        add     ax, 1000h
-        mov     word [blk_seg+2], ax
-        add     ax, 1000h
-        mov     word [blk_seg+4], ax
-        add     ax, 1000h
-        mov     word [blk_seg+6], ax
-        add     ax, 1000h
-        mov     word [blk_seg+8], ax
-        add     ax, 1000h
-        mov     word [blk_seg+10], ax
-        add     ax, 1000h
-        mov     word [blk_seg+12], ax
-        add     ax, 1000h
-        mov     word [blk_seg+14], ax
-        mov     word [blk_used], MAXBLK
-        mov     di, [handle]          ; DI = file handle, kept safe in loop
-        xor     si, si                ; block 0
-lf_r:
-        mov     bx, si
-        shl     bx, 1
-        mov     ax, [blk_seg+bx]      ; DS = data seg here (no pushes outstanding)
-        push    ds
-        mov     ds, ax                ; DS = block segment
-        mov     dx, 0
-        mov     cx, 8000h
-        push    di
-        mov     bx, di               ; BX = file handle for DOS
-        mov     ah, 3Fh
-        int     21h
-        pop     di
-        jc      lf_errp
+lf_ok:  mov     bx, ax               ; BX = handle
+        call    set_blk
+        mov     si, [blk0]
+lf_r:   push    ds
+        mov     ds, si               ; DS = block segment
+        xor     dx, dx
+        call    lf_rd                ; first half
+        jc      lf_err
         cmp     ax, cx
-        jb      lf_sh0
-        mov     dx, 8000h
-        mov     cx, 8000h
-        push    di
-        mov     bx, di               ; BX = file handle for DOS
-        mov     ah, 3Fh
-        int     21h
-        pop     di
-        jc      lf_errp
+        jb      lf_sh
+        mov     dx, cx               ; second half at 8000h
+        call    lf_rd
+        jc      lf_err
         cmp     ax, cx
-        jb      lf_sh8
-        pop     ds                    ; block full, DS = data seg
-        inc     si
-        cmp     si, [blk_used]
+        jb      lf_sh
+        pop     ds
+        add     si, 1000h
+        cmp     si, [blk_end]
         jb      lf_r
         ; all blocks full: force-terminate the last block (loses 2 bytes)
-        mov     bx, [blk_seg+14]
+        sub     si, 1000h
         push    ds
-        mov     ds, bx
+        mov     ds, si
         mov     word [0FFFEh], 0
         pop     ds
-        jmp     lf_de
-lf_sh0:                               ; short first half: DS = block seg, AX = count
-        mov     bx, ax
-        mov     byte [bx], 0          ; terminator
-        pop     ds                    ; DS = data seg
-        jmp     lf_de
-lf_sh8:                               ; short second half: DS = block seg, AX = count
-        mov     bx, ax
-        add     bx, 8000h
-        mov     byte [bx], 0          ; terminator
-        pop     ds                    ; DS = data seg, fall into de-escape
-lf_de:                                ; ---- strip ESC (1B) bytes, per block ----
-        xor     si, si
-        mov     cx, MAXBLK
-de_blk:
-        mov     es, [blk_seg+si]
-        xor     di, di
-        xor     bx, bx
-de_l:
-        mov     al, [es:bx]
-        or      al, al
-        jz      de_done
-        cmp     al, 1Ah
-        je      de_done
-        cmp     al, 1Bh
-        je      de_sk                   ; drop every ESC byte (RW 2.0 intro byte)
-        mov     al, [es:bx]
-        mov     [es:di], al
-        inc     bx
-        inc     di
-        jmp     de_l
-de_sk:
-        inc     bx
-        jmp     de_l
-de_done:
-        mov     byte [es:di], 0
-        add     si, 2
-        dec     cx
-        jnz     de_blk
+        jmp     lf_close
+lf_sh:  mov     di, ax               ; short read: terminate here
+        add     di, dx
+        mov     byte [di], 0
+        pop     ds
 lf_close:
-        mov     bx, [handle]
         mov     ah, 3Eh
         int     21h
         clc
         ret
-lf_errp:                              ; read error: DS = block seg, one push out
-        pop     ds
-        mov     bx, [handle]
+lf_err: pop     ds
         mov     ah, 3Eh
         int     21h
         stc
+        ret
+lf_rd:  mov     cx, 8000h
+        mov     ah, 3Fh
+        int     21h
         ret
 
 ;---------------- line table build -------------------------------------
 build_lines:
         mov     word [nlines], 1
-        mov     word [curlen], 0
-        mov     word [bidx], 0
-        mov     ax, [build_start]
-        mov     [boff], ax
-        mov     es, [blk_seg]
-        mov     ax, es
-        mov     bx, [lin_base]
-        mov     [bx], ax
-        mov     ax, [build_start]
-        mov     [bx+2], ax
-bl_l:
-        mov     bx, [boff]
-        mov     al, [es:bx]
-        cmp     al, 0
-        je      bl_done
-        cmp     al, 1Ah
-        je      bl_done
-        cmp     al, 0Dh
-        je      bl_cr
-        cmp     al, 0Ah
-        je      bl_lf
-        ; swallowed controls: invisible at render time, eat no columns
-        cmp     al, 01h
-        je      bl_sw
-        cmp     al, 03h
-        je      bl_sw
-        cmp     al, 04h
-        je      bl_sw
-        cmp     al, 06h
-        je      bl_sw
-        cmp     al, 07h
-        je      bl_sw
-        cmp     al, 1Ch
-        je      bl_sw
-        cmp     al, 1Dh
-        je      bl_sw
-        cmp     al, 1Eh
-        je      bl_sw
-        cmp     al, 1Fh
-        je      bl_sw
-        cmp     word [curlen], 255      ; line size cap = 255
-        jae     bl_cap
-        push    bx
-        mov     bl, al
-        cmp     bl, 0D1h                ; marks don't count as columns
-        je      bl_m
-        cmp     bl, 0D4h
-        jb      bl_cnt
-        cmp     bl, 0DBh
-        jbe     bl_m
-        cmp     bl, 0E7h
-        jb      bl_cnt
-        cmp     bl, 0EEh
-        ja      bl_cnt
-bl_m:
-        pop     bx
-        call    badv
-        jnc     bl_l
-        jmp     bl_done
-bl_sw:                                  ; swallowed control: advance only
-        call    badv
-        jnc     bl_l
-        jmp     bl_done
-bl_cnt:
-        pop     bx
-        inc     word [curlen]
-        call    badv
-        jnc     bl_l
-        jmp     bl_done
-bl_cap:                                 ; over 255 bytes: skip rest of line
-        call    badv
-        mov     bx, [boff]
-        mov     al, [es:bx]
-        cmp     al, 0
-        je      bl_done
-        cmp     al, 1Ah
-        je      bl_done
-        cmp     al, 0Dh
-        je      bl_cr
-        cmp     al, 0Ah
-        je      bl_lf
-        jmp     bl_cap
-bl_cr:
-        call    bl_close
-        call    badv
-        jc      bl_done
-        mov     bx, [boff]
-        cmp     byte [es:bx], 0Ah
-        jne     bl_add
-        call    badv
-        jc      bl_done
-bl_add:
-        call    bl_addent
+        mov     es, [blk0]
+        mov     si, [build_start]
+        mov     di, [lin_base]
+        mov     [di], es
+        mov     [di+2], si
+        add     di, 4                ; DI = next table entry
+        xor     bx, bx
+        xor     dx, dx               ; DL = columns in this line (caps at 255)
+bl_l:   mov     al, [es:si]
+        inc     si
+        jz      bl_wrap
+bl_c:   mov     bl, al
+        mov     ah, [cls+bx]         ; raw byte class
+        test    ah, ah
+        jnz     bl_sp
+bl_cnt: inc     dl                   ; column
+        jnz     bl_l
+        dec     dl                   ; line size cap = 255
         jmp     bl_l
-bl_lf:
-        call    bl_close
-        call    badv
-        jc      bl_done
-        call    bl_addent
+bl_wrap:
+        mov     ax, es               ; text continues in the next block
+        add     ax, 1000h
+        mov     es, ax
+        jmp     bl_c
+bl_sp:  test    ah, C_TERM
+        jnz     bl_term
+        test    ah, C_STYLE          ; style codes count (as in TREAD),
+        jnz     bl_cnt               ; marks/controls don't
+        jmp     bl_l
+bl_term:
+        cmp     al, 0Dh
+        je      bl_cr
+        cmp     al, 0Ah
+        je      bl_lf
+        jmp     bl_done              ; 00 / 1A: end of text
+bl_cr:  cmp     byte [es:si], 0Ah    ; CR LF = one break
+        jne     bl_lf
+        call    adv
+bl_lf:  call    bl_close
+        cmp     di, [lin_lim]        ; table full: keep scanning, no entry
+        jae     bl_l
+        inc     word [nlines]
+        mov     [di], es
+        mov     [di+2], si
+        add     di, 4
         jmp     bl_l
 bl_done:
-        call    bl_close
-        ret
-
+        ; fall through
 bl_close:
-        mov     ax, [curlen]
-        cmp     ax, [maxlen]
+        cmp     dl, [maxlen]
         jbe     bc1
-        mov     [maxlen], ax
-bc1:
-        mov     word [curlen], 0
-        ret
-
-bl_addent:
-        mov     ax, [lin_cap]
-        cmp     [nlines], ax
-        jae     bae_ret
-        push    di
-        mov     ax, [nlines]
-        shl     ax, 1
-        shl     ax, 1
-        mov     bx, ax
-        mov     ax, [bidx]
-        shl     ax, 1
-        mov     si, ax
-        mov     ax, [blk_seg+si]        ; block segment for entry 0
-        mov     di, [lin_base]
-        mov     [di+bx], ax
-        mov     ax, [boff]
-        mov     [di+bx+2], ax
-        pop     di
-        inc     word [nlines]
-bae_ret:
-        ret
-
-; badv: advance (bidx,boff), update ES; CY=1 past end
-badv:
-        inc     word [boff]
-        jnz     ba_ok
-        mov     word [boff], 0
-        inc     word [bidx]
-        mov     ax, [bidx]
-        cmp     ax, [blk_used]
-        jae     ba_end
-        shl     ax, 1
-        mov     bx, ax
-        mov     ax, [blk_seg+bx]
-        mov     es, ax
-ba_ok:
-        clc
-        ret
-ba_end:
-        stc
-        ret
-
-; calc_limits: topmax, maxh, maxlen>=80
-calc_limits:
-        mov     ax, [nlines]
-        mov     bl, [body]
-        xor     bh, bh
-        sub     ax, bx
-        jnc     cl1
-        xor     ax, ax
-cl1:
-        mov     [topmax], ax
-        mov     word [top], 0
-        mov     word [hshift], 0
-        mov     ax, [maxlen]
-        sub     ax, 80
-        jnc     cl2
-        xor     ax, ax
-cl2:
-        mov     [maxh], ax
+        mov     [maxlen], dl
+bc1:    xor     dl, dl
         ret
 
 ;---------------- command tail -----------------------------------------
 parse_tail:
         mov     si, 81h
 pt_scan:
-        mov     al, [si]
+        lodsb
         cmp     al, 0Dh
         je      pt_done
-        or      al, al
+        test    al, al
         jz      pt_done
         cmp     al, ' '
-        jne     pt_tok
-        inc     si
-        jmp     pt_scan
-pt_tok:
-        cmp     byte [si], '/'
+        je      pt_scan
+        cmp     al, '/'
         je      pt_sw
-        mov     di, fname
-pt_f:
-        mov     al, [si]
+        mov     di, fname            ; file name token
+pt_f:   mov     [di], al
+        inc     di
+        lodsb
         cmp     al, 0Dh
         je      pt_fend
-        or      al, al
+        test    al, al
         jz      pt_fend
         cmp     al, ' '
-        je      pt_fend
-        mov     [di], al
-        inc     di
-        inc     si
-        jmp     pt_f
+        jne     pt_f
 pt_fend:
         mov     byte [di], 0
         mov     byte [have_file], 1
+        dec     si
         jmp     pt_scan
-pt_sw:
-        mov     al, [si+1]
+pt_sw:  lodsb                        ; /v /c /e /h /t
         or      al, 20h
-        cmp     al, 'v'
-        jne     pt_s2
-        mov     byte [adapter], 2
-        mov     byte [forced], 1
-        jmp     pt_skip
-pt_s2:
-        cmp     al, 'c'
-        jne     pt_s3
-        mov     byte [adapter], 0
-        mov     byte [forced], 1
-        jmp     pt_skip
-pt_s3:
-        cmp     al, 'e'
-        jne     pt_s4
-        mov     byte [adapter], 1
-        mov     byte [forced], 1
-        jmp     pt_skip
-pt_s4:
-        cmp     al, 'h'
-        jne     pt_t
-        mov     byte [adapter], 3
-        mov     byte [forced], 1
-        jmp     pt_skip
-pt_t:
-        cmp     al, 't'
-        jne     pt_skip
+        push    ds
+        pop     es
+        mov     di, sw_chars
+        mov     cx, 5
+        repne   scasb
+        jne     pt_scan
+        sub     di, sw_chars+1
+        cmp     di, 4
+        jne     pt_adp
         mov     byte [test_mode], 1
-pt_skip:
-        inc     si
-        inc     si
+        jmp     pt_scan
+pt_adp: mov     al, [sw_adap+di]
+        mov     [adapter], al
+        mov     byte [forced], 1
         jmp     pt_scan
 pt_done:
         ret
 
 ;---------------- selftest (/t) -----------------------------------------
 selftest:
-        ; row 0 = raw FF bytes straight to A000 (proves direct writes)
-        mov     ax, 0A000h
-        mov     es, ax
-        mov     di, 22 * 80
-        mov     cx, 80
-        mov     al, 0FFh
-stf1:
-        mov     [es:di], al
-        inc     di
-        loop    stf1
-        mov     byte [cur_col], 0
-        mov     byte [cur_row], 0
-        mov     byte [cell_has], 0
+        mov     bx, 22*2             ; scanline 22 solid (proves VRAM writes)
+        call    st_line
+        xor     al, al
+        call    set_row
         mov     si, s_selft
         call    puts
-        mov     word [hl_y], 19
-        call    hline
-        mov     byte [cur_row], 2
+        mov     bx, CELLH*2          ; rule under the status row
+        call    st_line
+        mov     al, 2
+        call    set_row
         mov     byte [cur_col], 0
-        mov     byte [cell_has], 0
         mov     si, s_ok
         call    puts
-        mov     cx, 273                ; wait 15s via BIOS tick counter (18.2/s)
+        mov     cx, 273              ; wait 15s via BIOS tick counter (18.2/s)
         push    ds
         xor     ax, ax
         mov     ds, ax
         mov     bx, [46Ch]
         add     bx, cx
-st_d1:
-        mov     ax, [46Ch]
+st_d1:  mov     ax, [46Ch]
         cmp     ax, bx
         jb      st_d1
         pop     ds
         ret
+st_line:
+        mov     cx, 1
+        mov     al, 0FFh
+        xor     bp, bp
+        mov     dx, [row_bytes]
+        jmp     fill_rows
 
 ;---------------- video HAL ---------------------------------------------
 ; [adapter]: 0 CGA / 1 EGA / 2 VGA / 3 HGC
 detect_video:
-        push    ds                     ; BIOS mode byte 40:49h (= linear
-        xor     ax, ax                 ; 449h) tells the display type the
-        mov     ds, ax                 ; box booted with: 7 = mono (HGC/MDA)
+        push    ds                   ; BIOS mode byte 40:49h: 7 = mono
+        xor     ax, ax
+        mov     ds, ax
         mov     bl, [449h]
         pop     ds
+        mov     al, 3
         cmp     bl, 7
-        jne     dv_color
-        mov     byte [adapter], 3      ; mono text -> Hercules path
-        ret
-dv_color:
+        je      dv_set               ; mono text -> Hercules path
         mov     ax, 1A00h
         int     10h
         cmp     al, 1Ah
-        jne     dv_ega
-        mov     byte [adapter], 2
-        ret
-dv_ega:
-        ; EGA check: the video BIOS posts its flags in BDA 40:87h (= linear
-        ; 487h) -- zero on CGA/HGC boxes, non-zero when an EGA (or better)
-        ; posts. VGA was already taken by 1A00h above, so non-zero here
-        ; means EGA. Verified on DOSBox-X: svga_s3/ega = 60h, cga/herc = 00h.
-        push    ds
-        xor     ax, ax
+        mov     al, 2
+        je      dv_set               ; VGA
+        push    ds                   ; EGA BIOS flags 40:87h: non-zero
+        xor     ax, ax               ; when an EGA (or better) posts
         mov     ds, ax
-        mov     bl, [487h]
+        mov     bh, [487h]
         pop     ds
-        or      bl, bl
-        jz      dv_hgct
-        mov     byte [adapter], 1
-        ret
-dv_hgct:
-        ; Hercules toggle test: port 3BA bit 7 (vsync) pulses on HGC,
-        ; stays 0 on VGA/CGA. Classic Podanoffsky detection.
+        mov     al, 1
+        test    bh, bh
+        jnz     dv_set               ; EGA
+        ; Hercules toggle test: port 3BA bit 7 (vsync) pulses on HGC
         mov     dx, 3BAh
         in      al, dx
         and     al, 80h
         mov     ah, al
         mov     cx, 7FFFh
-dhg1:
-        in      al, dx
+dhg1:   in      al, dx
         and     al, 80h
         cmp     al, ah
         loopz   dhg1
-        jnz     dv_hgc                 ; bit changed -> HGC present
-dv_cga:
-        mov     byte [adapter], 0
-        ret
-dv_hgc:
-        mov     byte [adapter], 3
+        mov     al, 0                ; CGA
+        jz      dv_set
+        mov     al, 3                ; bit changed -> HGC present
+dv_set: mov     [adapter], al
         ret
 
-gfx_on:
-        mov     al, [adapter]
-        or      al, al
-        jz      go_cga
-        cmp     al, 1
-        je      go_ega
-        cmp     al, 3
-        je      go_hgc
-        mov     byte [mode_num], 12h
-        mov     word [planar], 1
-        mov     word [vseg], 0A000h    ; planar modes: erase_rows/vband target
-        mov     byte [text_rows], 25
-        mov     word [vram_size], 9600h
-        mov     word [scr_px], 640
-        jmp     go_set
-go_ega:
-        mov     byte [mode_num], 10h
-        mov     word [planar], 1
-        mov     word [vseg], 0A000h
-        mov     byte [text_rows], 18    ; 1 status + 17 body lines (342 <= 350)
-        mov     word [vram_size], 6D60h
-        mov     word [scr_px], 640
-        jmp     go_set
-go_hgc:
-        mov     word [planar], 0
-        mov     word [vseg], 0B000h
-        mov     word [bank_mask], 3
-        mov     byte [yshift], 2
-        mov     word [row_bytes], 90
-        mov     byte [text_cols], 90
-        mov     byte [text_rows], 18    ; 1 status + 17 body lines (real HGC: 342 <= 348)
-        mov     word [vram_size], 8000h
-        mov     word [scr_px], 720
-        mov     dx, 3BFh               ; enable graphics + both pages
+gfx_on: mov     al, [adapter]
+        mov     ah, VPARM_SZ
+        mul     ah
+        add     ax, vparm
+        mov     si, ax
+        mov     di, mode_num         ; copy the mode parameters
+        mov     cx, VPARM_SZ
+        push    ds
+        pop     es
+        rep     movsb
+        cmp     byte [adapter], 3
+        jne     go_bios
+        mov     dx, 3BFh             ; HGC: enable graphics + both pages
         mov     al, 3
         out     dx, al
         mov     dx, 3B8h
-        mov     al, 2                  ; graphics mode, video off
+        mov     al, 2                ; graphics mode, video off
         out     dx, al
-        mov     dx, 3B4h               ; program 6845 CRTC R0..R11
+        mov     dx, 3B4h             ; program 6845 CRTC R0..R11
         mov     si, hgc_crtc
         mov     cx, 12
         xor     ah, ah
-gh1:
-        mov     al, ah
+gh1:    mov     al, ah
         out     dx, al
         inc     dx
-        mov     al, [si]
+        lodsb
         out     dx, al
         dec     dx
-        inc     si
         inc     ah
         loop    gh1
-        jmp     go_done               ; video comes on after clear_screen
-go_cga:
-        mov     byte [mode_num], 6
-        mov     word [planar], 0
-        mov     word [vseg], 0B800h
-        mov     word [bank_mask], 1
-        mov     byte [yshift], 1
-        mov     word [row_bytes], 80
-        mov     byte [text_rows], 10
-        mov     word [vram_size], 4000h
-        mov     word [scr_px], 640
-go_set:
-        mov     al, [text_rows]
-        mov     [body], al              ; body rows = total rows (status on row 0)
-        cmp     byte [adapter], 2       ; VGA: drop the partially visible last row
-        jne     gs_b1
-        dec     byte [body]
-gs_b1:
+        call    go_tab               ; (needs vrow_tab? no - just clears)
+        jmp     clear_screen         ; HGC: clear, then video on
+go_bios:
         mov     ah, 0
         mov     al, [mode_num]
         int     10h
-        cmp     word [planar], 0
-        je      go_done
-        mov     dx, GDC               ; ONE-TIME setup: from here on all
-        mov     al, 0                 ; drawing is plain memory writes:
-        out     dx, al                ; SR = 0
-        inc     dx
-        mov     al, 0
-        out     dx, al
-        dec     dx
-        mov     al, 1                 ; ESR = 0 -> CPU byte to ALL planes
-        out     dx, al
-        inc     dx
-        mov     al, 0
-        out     dx, al
-        dec     dx
-        mov     al, 3                 ; data rotate = 0
-        out     dx, al
-        inc     dx
-        mov     al, 0
-        out     dx, al
-        dec     dx
-        mov     al, 5                 ; write mode 0
-        out     dx, al
-        inc     dx
-        mov     al, 0
-        out     dx, al
-        dec     dx
-        mov     al, 8                 ; bitmask = FF
-        out     dx, al
-        inc     dx
-        mov     al, 0FFh
-        out     dx, al
-go_done:
-        push    ax
-        push    bx
-        push    cx
-        push    dx
-        push    di
-        push    es
-        mov     ax, cs
-        mov     es, ax
-        mov     word [vrt_val+0], 0
+        cmp     byte [planar], 0
+        je      go_tab
+        mov     dx, 3CEh             ; GDC: SR=0, ESR=0, rotate 0, write
+        mov     si, gdc_tab          ;      mode 0, bitmask FF - from here
+        mov     cx, 5                ;      on all drawing is plain writes
+gd1:    lodsw
+        out     dx, ax
+        loop    gd1
+go_tab: ; vrow_tab[y] = VRAM offset of scanline y (banks for CGA/HGC)
         mov     word [vrt_val+2], 2000h
         mov     word [vrt_val+4], 4000h
         mov     word [vrt_val+6], 6000h
-        xor     dx, dx                  ; y
+        xor     dx, dx               ; y
         mov     di, vrow_tab
         mov     cx, 512
-vrt_l:
-        mov     bx, dx
+vrt_l:  mov     bx, dx
         and     bx, [bank_mask]
         shl     bx, 1
-        mov     ax, [vrt_val+bx]        ; running (y>>yshift)*row_bytes per bank
-        mov     es:[di], ax
+        mov     ax, [vrt_val+bx]
+        stosw
         add     ax, [row_bytes]
         mov     [vrt_val+bx], ax
-        inc     di
-        inc     di
         inc     dx
         loop    vrt_l
-        pop     es
-        pop     di
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
         ret
 
 gfx_off:
         cmp     byte [adapter], 3
         jne     gf1
-        mov     dx, 3B8h               ; back to text mode first
+        mov     dx, 3B8h             ; HGC: back to text mode first
         mov     al, 28h
         out     dx, al
         mov     dx, 3BFh
         mov     al, 0
         out     dx, al
-gf1:
-        mov     ah, 0
+gf1:    mov     ah, 0
         mov     al, [old_mode]
         int     10h
         ret
 
 clear_screen:
-        push    ax
-        push    cx
-        push    dx
-        push    di
-        push    es
-        mov     byte [status_shadow], 0 ; empty shadow: forces a full status
-        cmp     word [planar], 0
-        je      cs_int
-        mov     ax, 0A000h
-        mov     es, ax
+        mov     es, [vseg]
         xor     di, di
         mov     cx, [vram_size]
         shr     cx, 1
         xor     ax, ax
-        cld
-        rep stosw
-        jmp     cs_ret
-cs_int:
-        mov     es, [vseg]             ; CGA / HGC interleave
-        xor     di, di
-        mov     cx, [vram_size]
-        shr     cx, 1
-        xor     ax, ax
-        cld
-        rep stosw
+        rep     stosw
         cmp     byte [adapter], 3
         jne     cs_ret
-        mov     dx, 3B8h               ; HGC: video on after clear
+        mov     dx, 3B8h             ; HGC: video on after the clear
         mov     al, 0Ah
         out     dx, al
-cs_ret:
-        pop     es
-        pop     di
-        pop     dx
-        pop     cx
-        pop     ax
-        ret
+cs_ret: ret
 
-; il_off: AX = y -> DI = interleave offset of (y,[pg_x])
-;   via vrow_tab LUT (built once in go_done): no mul on the hot path
-il_off:
-        push    bx
-        mov     bx, ax
-        shl     bx, 1
-        mov     di, [vrow_tab+bx]       ; bank*2000h + (y>>yshift)*row_bytes
-        mov     ax, [pg_x]
-        shr     ax, 1
-        shr     ax, 1
-        shr     ax, 1
-        add     di, ax
-        pop     bx
-        ret
+;---------------- data --------------------------------------------------
+; mode parameters: mode, vseg, bank_mask, row_bytes, text_cols, body,
+;                  vram_size, planar   (copied over mode_num..planar)
+vparm:  db 06h
+        dw 0B800h, 1, 80
+        db 80, 9
+        dw 4000h
+        db 0                          ; CGA 640x200
+        db 10h
+        dw 0A000h, 0, 80
+        db 80, 17
+        dw 6D60h
+        db 1                          ; EGA 640x350
+        db 12h
+        dw 0A000h, 0, 80
+        db 80, 24
+        dw 9600h
+        db 1                          ; VGA 640x480
+        db 0
+        dw 0B000h, 3, 90
+        db 90, 17
+        dw 8000h
+        db 0                          ; HGC 720x348
+gdc_tab: dw 0000h, 0001h, 0003h, 0005h, 0FF08h
+hgc_crtc:                             ; 6845 R0..R11 for 720x348 gfx
+        db 35h, 2Dh, 2Eh, 07h, 5Bh, 02h, 57h, 57h, 02h, 03h, 00h, 00h
+sw_chars: db "vceht"
+sw_adap:  db 2, 0, 1, 3
 
-hline:
-        push    ax
-        push    cx
-        push    dx
-        push    di
-        push    es
-        mov     al, 0FFh
-        cmp     byte [inv_flag], 0      ; inverse mode: draw the rule black
-        je      hl0
-        mov     al, 0
-hl0:
-        mov     dl, al                 ; keep color: MUL below clobbers AL
-        cmp     word [planar], 0
-        je      hl_int
-        mov     ax, 0A000h
-        mov     es, ax
-        mov     ax, [hl_y]
-        mov     bx, 80
-        mul     bx
-        mov     di, ax
-        mov     al, dl                 ; rule color (AL was clobbered by MUL)
-        mov     cx, 80
-hl_p:
-        mov     [es:di], al
-        inc     di
-        loop    hl_p
-        jmp     hl_ret
-hl_int:
-        mov     es, [vseg]             ; CGA / HGC
-        mov     word [pg_x], 0
-        mov     ax, [hl_y]
-        call    il_off
-        mov     cx, [row_bytes]
-        mov     al, 0FFh
-        cmp     byte [inv_flag], 0     ; inverse mode: draw the rule black
-        je      hl_c2
-        mov     al, 0
-hl_c2:
-        mov     [es:di], al
-        inc     di
-        loop    hl_c2
-hl_ret:
-        pop     es
-        pop     di
-        pop     dx
-        pop     cx
-        pop     ax
-        ret
+; byte classes for 00h-1Fh
+cls_lo: db C_TERM, C_SWAL, C_STYLE, C_SWAL, C_SWAL, C_STYLE, C_SWAL, C_SWAL
+        db 0, 0, C_TERM, 0, 0, C_TERM, C_STYLE, C_STYLE
+        db 0, 0, C_STYLE, C_STYLE, C_STYLE, C_STYLE, C_STYLE, C_STYLE
+        db 0, 0, C_TERM, C_SWAL, C_SWAL, C_SWAL, C_SWAL, C_SWAL
+; byte classes for D1h-EEh (Thai combining marks)
+cls_hi: db C_COMB, 0, 0, C_COMB, C_COMB, C_COMB, C_COMB, C_COMB, C_COMB, C_COMB, C_COMB
+        db 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        db C_COMB, C_COMB, C_COMB, C_COMB, C_COMB, C_COMB, C_COMB, C_COMB
+; style_reg xor masks per style code 00h-17h
+stx:    db 0, 0, 01h, 0, 0, 02h, 0, 0, 0, 0, 0, 0, 0, 0, 10h, 20h
+        db 0, 0, 0Ch, 08h, 20h, 40h, 10h, 40h
+; nibble -> pixel-doubled byte (expanded style)
+nib16:  db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
 
-;---------------- text layer -------------------------------------------
-puts:
-        mov     byte [cell_has], 0
-puts_j:
-        lodsb
-        or      al, al
-        jz      puts_done
-        call    draw_char
-        jmp     puts_j
-puts_done:
-        ret
+; key table: extended keys = scan code | 80h, ASCII keys lower-cased
+keytab: db 0C8h, 0D0h, 0C9h, 0D1h, 0C7h, 0CFh, 0CBh, 0CDh, 'q', 1Bh, 'c', ' ', 08h, 'r'
+KEYN    equ $-keytab
+keyhnd: dw k_up, k_dn, k_pu, k_pd, k_home, k_end, k_left, k_right
+        dw v_quit, v_quit, k_ku, k_pd, k_pu, view_loop
 
-puts_line:
-        mov     byte [cur_col], 0
-        mov     byte [cell_has], 0
-        call    puts
-        inc     byte [cur_row]
-        ret
-
-;---------------- cell renderer (proven mk4 base + styles) --------------
-draw_char:
-        cmp     al, 1Bh                 ; WS escape: invisible, eats nothing
-        je      dc_skip
-        ; swallowed controls (match TREAD): invisible, eat nothing
-        cmp     al, 01h
-        je      dc_skip
-        cmp     al, 03h
-        je      dc_skip
-        cmp     al, 04h
-        je      dc_skip
-        cmp     al, 06h
-        je      dc_skip
-        cmp     al, 07h
-        je      dc_skip
-        cmp     al, 1Ch
-        je      dc_skip
-        cmp     al, 1Dh
-        je      dc_skip
-        cmp     al, 1Eh
-        je      dc_skip
-        cmp     al, 1Fh
-        je      dc_skip
-        cmp     al, 02h                 ; ---- style control bytes (toggle) ----
-        je      as_tgl0
-        cmp     al, 05h
-        je      as_tgl1
-        cmp     al, 0Eh
-        je      as_tgl4
-        cmp     al, 0Fh
-        je      as_tgl5
-        cmp     al, 12h
-        je      as_tgl2
-        cmp     al, 13h
-        je      as_tgl3
-        cmp     al, 17h
-        je      as_tgl6
-        cmp     al, 15h
-        je      as_tgl6                 ; 15h = italic too (RW files)
-        cmp     al, 14h
-        je      as_tgl7
-        cmp     al, 16h
-        je      as_tgl8
-        jmp     dc_go1
-dc_skip:
-        ret
-dc_go1:
-        mov     [chr], al
-        cmp     al, 0D1h        ; ั upper
-        je      dc_upper
-        cmp     al, 0D4h        ; D4-D7 upper (ิ ี ึ ื)
-        jb      dc_cklow
-        cmp     al, 0D7h
-        jbe     dc_upper
-        cmp     al, 0D8h        ; D8-DA lower (ุ ู ฺ)
-        jb      dc_base
-        cmp     al, 0DAh
-        jbe     dc_lower
-        cmp     al, 0DBh        ; DB upper
-        je      dc_upper
-        cmp     al, 0E7h        ; E7-EE upper (็ ่ ้ ๊ ๋ ์ ํ ๎)
-        jb      dc_base
-        cmp     al, 0EEh
-        jbe     dc_upper
-        jmp     dc_base
-dc_cklow:
-        jmp     dc_base
-dc_base:
-        mov     byte [cell_upper], 0
-        call    set_tall
-        call    cell_copy
-        mov     byte [back], 0
-        mov     dl, 0
-        call    dc_draw               ; stretched glyph drawn ONCE (16px wide)
-        mov     byte [cell_has], 1
-        inc     byte [cur_col]
-        test    byte [style_reg], 02h
-        jz      dc_b1
-        mov     byte [exp_prev], 1    ; marks after this cell shift back by 2
-        inc     byte [cur_col]        ; expanded char occupies 2 columns
-        ret
-dc_b1:
-        mov     byte [exp_prev], 0
-dc_b2:
-        ret
-as_tgl0:
-        xor     byte [style_reg], 01h   ; bold
-        ret
-as_tgl1:
-        xor     byte [style_reg], 02h   ; expand
-        ret
-as_tgl2:
-        xor     byte [style_reg], 0Ch   ; double underline toggles the pair
-        ret
-as_tgl3:
-        xor     byte [style_reg], 08h   ; single underline
-        ret
-as_tgl4:
-        and     byte [style_reg], 0DFh  ; sub (clears super)
-        xor     byte [style_reg], 10h
-        ret
-as_tgl5:
-        and     byte [style_reg], 0EFh  ; super (clears sub)
-        xor     byte [style_reg], 20h
-        ret
-as_tgl6:
-        xor     byte [style_reg], 40h   ; italic
-        ret
-as_tgl7:
-        and     byte [style_reg], 0EFh  ; super (clears sub)
-        xor     byte [style_reg], 20h
-        ret
-as_tgl8:
-        and     byte [style_reg], 0DFh  ; sub (clears super)
-        xor     byte [style_reg], 10h
-        ret
-as_tgl9:
-        and     byte [style_reg], 0CFh  ; cancel sub+super
-        ret
-
-; style_toggle: apply style code AL to [style_reg] (shared by draw_char
-; and the hshift skip pass so the state stays consistent)
-style_toggle:
-        cmp     al, 02h
-        je      stg0
-        cmp     al, 05h
-        je      stg1
-        cmp     al, 0Eh
-        je      stg4
-        cmp     al, 0Fh
-        je      stg5
-        cmp     al, 12h
-        je      stg2
-        cmp     al, 13h
-        je      stg3
-        cmp     al, 17h
-        je      stg6
-        cmp     al, 15h
-        je      stg6                    ; 15h = italic too (RW files)
-        cmp     al, 14h
-        je      stg7
-        cmp     al, 16h
-        je      stg8
-        ret
-stg0:
-        xor     byte [style_reg], 01h
-        ret
-stg1:
-        xor     byte [style_reg], 02h
-        ret
-stg2:
-        xor     byte [style_reg], 0Ch
-        ret
-stg3:
-        xor     byte [style_reg], 08h
-        ret
-stg4:
-        and     byte [style_reg], 0DFh
-        xor     byte [style_reg], 10h
-        ret
-stg5:
-        and     byte [style_reg], 0EFh
-        xor     byte [style_reg], 20h
-        ret
-stg6:
-        xor     byte [style_reg], 40h
-        ret
-stg7:
-        and     byte [style_reg], 0EFh
-        xor     byte [style_reg], 20h
-        ret
-stg8:
-        and     byte [style_reg], 0DFh
-        xor     byte [style_reg], 10h
-        ret
-
-dc_upper:
-        cmp     byte [cell_has], 0
-        je      dc_base
-        mov     byte [cell_upper], 1
-        mov     al, [exp_prev]
-        inc     al
-        mov     [back], al            ; 1 normal, 2 after an expanded base
-        call    cell_or
-        mov     dl, 0
-        call    dc_draw
-        ret
-
-dc_lower:
-        cmp     byte [cell_has], 0
-        je      dc_base
-        mov     al, [exp_prev]
-        inc     al
-        mov     [back], al
-        call    cell_or
-        mov     dl, 0
-        call    dc_draw
-        ret
-
-dc_tone:
-        cmp     byte [cell_has], 0
-        je      dc_base
-        mov     al, [exp_prev]
-        inc     al
-        mov     [back], al
-        cmp     byte [cell_upper], 0
-        jne     dt_high
-        cmp     byte [cell_tall], 0
-        jne     dt_high
-        call    cell_or_sh4
-        jmp     dt_d
-dt_high:
-        call    cell_or
-dt_d:
-        mov     dl, 0
-        call    dc_draw
-        ret
-
-; cell_or_sh4: cell_buf[r+4] |= glyph[r][r+4..]  (tone snug shift)
-cell_or_sh4:
-        push    ax
-        push    cx
-        push    si
-        push    di
-        mov     al, [chr]
-        xor     ah, ah
-        mov     bx, CELLH
-        mul     bx
-        add     ax, font8x19
-        mov     si, ax
-        add     si, 4
-        mov     di, cell_buf
-        add     di, 4
-        mov     cx, 16
-cs4:
-        mov     al, [si]
-        or      al, [di]
-        mov     [di], al
-        inc     si
-        inc     di
-        loop    cs4
-        pop     di
-        pop     si
-        pop     cx
-        pop     ax
-        ret
-
-set_tall:
-        mov     byte [cell_tall], 0
-        cmp     al, 0BBh
-        je      st_yes
-        cmp     al, 0BDh
-        je      st_yes
-        cmp     al, 0BFh
-        je      st_yes
-        cmp     al, 0CAh
-        je      st_yes
-        cmp     al, 0E2h
-        je      st_yes
-        cmp     al, 0E3h
-        je      st_yes
-        ret
-st_yes:
-        mov     byte [cell_tall], 1
-        ret
-
-; cell_copy: cell_buf = glyph[chr]
-cell_copy:
-        push    ax
-        push    cx
-        push    si
-        push    di
-        mov     al, [chr]
-        xor     ah, ah
-        mov     bx, CELLH
-        mul     bx
-        add     ax, font8x19
-        mov     si, ax
-        mov     di, cell_buf
-        mov     cx, CELLH
-cc1:
-        mov     al, [si]
-        mov     [di], al
-        inc     si
-        inc     di
-        loop    cc1
-        pop     di
-        pop     si
-        pop     cx
-        pop     ax
-        ret
-
-; cell_or: cell_buf |= glyph[chr]
-cell_or:
-        push    ax
-        push    cx
-        push    si
-        push    di
-        mov     al, [chr]
-        xor     ah, ah
-        mov     bx, CELLH
-        mul     bx
-        add     ax, font8x19
-        mov     si, ax
-        mov     di, cell_buf
-        mov     cx, CELLH
-co1:
-        mov     al, [si]
-        or      al, [di]
-        mov     [di], al
-        inc     si
-        inc     di
-        loop    co1
-        pop     di
-        pop     si
-        pop     cx
-        pop     ax
-        ret
-
-; apply_style: transform cell_tmp per style_reg (cx-safe loops)
-apply_style:
-        push    ax
-        push    bx
-        push    cx
-        push    dx
-        push    si
-        mov     al, [style_reg]
-        test    al, 01h                 ; ---- bold
-        jz      as_shear
-        xor     si, si
-as_b1:
-        mov     ah, [cell_tmp+si]
-        mov     bl, ah
-        shr     bl, 1
-        or      ah, bl
-        mov     [cell_tmp+si], ah
-        inc     si
-        cmp     si, CELLH
-        jb      as_b1
-as_shear:
-        test    al, 40h                 ; ---- italic shear (in-cell)
-        jz      as_sub
-        xor     si, si
-as_s1:
-        mov     bx, 19
-        sub     bx, si
-        mov     dh, 3
-        mov     cl, dh
-        shr     bx, cl                  ; (19-r)/8 = 0..2
-        jz      as_s2
-        mov     ah, [cell_tmp+si]
-        mov     cl, bl
-        shr     ah, cl
-        mov     [cell_tmp+si], ah
-as_s2:
-        inc     si
-        cmp     si, CELLH
-        jb      as_s1
-as_sub:
-        test    al, 10h                 ; ---- subscript: shift down 3
-        jz      as_sup
-        mov     si, 15
-as_u1:
-        mov     ah, [cell_tmp+si]
-        mov     [cell_tmp+si+3], ah
-        dec     si
-        jns     as_u1
-        mov     byte [cell_tmp+0], 0
-        mov     byte [cell_tmp+1], 0
-        mov     byte [cell_tmp+2], 0
-as_sup:
-        test    al, 20h                 ; ---- superscript: shift up 5
-        jz      as_ul
-        mov     si, 5
-as_p1:
-        mov     ah, [cell_tmp+si]
-        mov     [cell_tmp+si-5], ah
-        inc     si
-        cmp     si, CELLH
-        jb      as_p1
-        mov     byte [cell_tmp+14], 0
-        mov     byte [cell_tmp+15], 0
-        mov     byte [cell_tmp+16], 0
-        mov     byte [cell_tmp+17], 0
-        mov     byte [cell_tmp+18], 0
-as_ul:
-        test    al, 08h                 ; ---- underline single
-        jz      as_ret
-        cmp     byte [cell_buf+17], 0   ; descender/lower-mark ink on the
-        jnz     as_ret                  ; rule row: skip it (ุ ู ฺ, ฒ, ณ, ...)
-        mov     byte [cell_tmp+17], 0FFh
-        test    al, 04h                 ; ---- underline double
-        jz      as_ret
-        cmp     byte [cell_buf+18], 0
-        jnz     as_ret
-        mov     byte [cell_tmp+18], 0FFh
-as_ret:
-        pop     si
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        ret
-
-; dc_draw: draw composed cell at ((cur_col-[back])*8, cur_row*20+DL)
-;   expand (style bit0): each pixel doubled -> 16px wide (TREAD style)
-dc_draw:
-
-        mov     al, [cur_col]
-        xor     ah, ah
-        sub     al, [back]
-        jnc     dd1
-        xor     al, al
-dd1:
-        shl     ax, 1
-        shl     ax, 1
-        shl     ax, 1
-        mov     [pg_x], ax
-        mov     al, [cur_row]
-        xor     ah, ah
-        mov     bx, ax
-        shl     ax, 1
-        shl     ax, 1
-        shl     ax, 1
-        shl     ax, 1        ; 16r
-        add     ax, bx       ; 17r
-        add     ax, bx       ; 18r
-        add     ax, bx       ; 19r = row*CELLH
-        mov     dh, 0
-        add     ax, dx
-        mov     [pg_y], ax
-        ; copy cell_buf -> cell_tmp, apply non-expand styles
-        push    si
-        xor     si, si
-dd_c1:
-        mov     al, [cell_buf+si]
-        mov     [cell_tmp+si], al
-        inc     si
-        cmp     si, CELLH
-        jb      dd_c1
-        call    apply_style
-        mov     al, [style_reg]
-        test    al, 02h                 ; ---- expand: pixel doubling
-        jz      dd_norm
-        call    dd_wide
-        jmp     dd_ret
-dd_norm:
-        mov     word [pg_src], cell_tmp
-        mov     ax, [scr_px]
-        sub     ax, 8
-        cmp     [pg_x], ax
-        jae     dd_ret
-        call    put_glyph
-dd_ret:
-        pop     si
-        ret
-
-; dd_wide: stretch cell_tmp -> cell_wide (40 bytes) and blit 2 cells wide
-dd_wide:
-        push    ax
-        push    bx
-        push    cx
-        push    dx
-        push    si
-        push    di
-        push    es
-        xor     si, si
-        xor     di, di
-        mov     cx, CELLH
-dw_r:
-        mov     al, [cell_tmp+si]
-        call    dd_stretch              ; -> DH=hi, DL=lo
-        mov     [cell_wide+di], dh
-        mov     [cell_wide+di+1], dl
-        inc     si
-        add     di, 2
-        loop    dw_r
-        ; blit: 20 rows x 2 bytes at pg_x, pg_x+8
-        xor     si, si
-        cmp     word [planar], 0
-        je      dw_i
-        mov     ax, 0A000h
-        mov     es, ax
-        mov     ax, [pg_y]
-        mov     bx, 80
-        mul     bx
-        mov     di, ax
-        mov     ax, [pg_x]
-        shr     ax, 1
-        shr     ax, 1
-        shr     ax, 1
-        add     di, ax
-        mov     ax, [scr_px]
-        sub     ax, 8
-        cmp     [pg_x], ax            ; last column: hi byte only (avoid wrap)
-        jae     dw_h
-        mov     cx, CELLH
-dw_b:
-        mov     al, [cell_wide+si]
-        mov     [es:di], al
-        mov     al, [cell_wide+si+1]
-        mov     [es:di+1], al
-        inc     si
-        inc     si
-        add     di, 80
-        loop    dw_b
-        jmp     dw_d
-dw_h:                               ; stretched hi half only
-        mov     cx, CELLH
-dw_h1:
-        mov     al, [cell_wide+si]
-        mov     [es:di], al
-        add     si, 2
-        add     di, 80
-        loop    dw_h1
-        jmp     dw_d
-dw_i:
-        mov     ax, [scr_px]
-        sub     ax, 8
-        cmp     [pg_x], ax            ; interleaved: skip at last column
-        jae     dw_d
-        mov     es, [vseg]
-        mov     ax, [pg_y]
-        mov     cx, CELLH
-dw_i1:
-        push    ax
-        push    cx
-        mov     [pg_y], ax
-        call    il_off                ; il_off adds [pg_x]/8 itself
-        mov     al, [cell_wide+si]
-        mov     [es:di], al
-        mov     al, [cell_wide+si+1]
-        mov     [es:di+1], al
-        add     si, 2
-        pop     cx
-        pop     ax
-        inc     ax
-        loop    dw_i1
-dw_d:
-        pop     es
-        pop     di
-        pop     si
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        ret
-
-; dd_stretch: double each pixel of AL (8px -> 16px). DH=hi (px0-3), DL=lo (px4-7)
-dd_stretch:
-        push    ax
-        push    bx
-        mov     bl, al
-        xor     bh, bh
-        mov     dh, [tbl_hi+bx]
-        mov     dl, [tbl_lo+bx]
-        pop     bx
-        pop     ax
-        ret
-
-; tbl_hi[n] = high nibble of n with each bit doubled; tbl_lo = low nibble doubled
-tbl_hi:
-        db 000h,000h,000h,000h,000h,000h,000h,000h,000h,000h,000h,000h,000h,000h,000h,000h
-        db 003h,003h,003h,003h,003h,003h,003h,003h,003h,003h,003h,003h,003h,003h,003h,003h
-        db 00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch,00Ch
-        db 00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh,00Fh
-        db 030h,030h,030h,030h,030h,030h,030h,030h,030h,030h,030h,030h,030h,030h,030h,030h
-        db 033h,033h,033h,033h,033h,033h,033h,033h,033h,033h,033h,033h,033h,033h,033h,033h
-        db 03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch,03Ch
-        db 03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh,03Fh
-        db 0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h,0C0h
-        db 0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h,0C3h
-        db 0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh,0CCh
-        db 0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh,0CFh
-        db 0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h,0F0h
-        db 0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h,0F3h
-        db 0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh,0FCh
-        db 0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh,0FFh
-tbl_lo:
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-        db 000h,003h,00Ch,00Fh,030h,033h,03Ch,03Fh,0C0h,0C3h,0CCh,0CFh,0F0h,0F3h,0FCh,0FFh
-
-
-put_glyph:
-        push    ax
-        push    bx
-        push    cx
-        push    dx
-        push    si
-        push    di
-        push    es
-        mov     si, [pg_src]
-        cmp     word [planar], 0
-        je      pg_il
-        mov     ax, 0A000h
-        mov     es, ax
-        mov     ax, [pg_y]
-        mov     bx, 80
-        mul     bx
-        mov     di, ax
-        mov     ax, [pg_x]
-        shr     ax, 1
-        shr     ax, 1
-        shr     ax, 1
-        add     di, ax
-        mov     cx, CELLH
-pg_p1:
-        mov     al, [si]
-        cmp     byte [inv_flag], 0
-        je      pg_p1n
-        not     al
-pg_p1n:
-        stosb
-        inc     si
-        add     di, 79
-        loop    pg_p1
-        jmp     pg_ret
-pg_il:
-        mov     es, [vseg]
-        mov     ax, [pg_y]
-        mov     cx, CELLH
-pg_i1:
-        push    ax
-        push    cx
-        call    il_off
-        mov     al, [si]
-        cmp     byte [inv_flag], 0
-        je      pg_i1n
-        not     al
-pg_i1n:
-        mov     [es:di], al
-        inc     si
-        pop     cx
-        pop     ax
-        inc     ax
-        loop    pg_i1
-pg_ret:
-        pop     es
-        pop     di
-        pop     si
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        ret
-
-;---------------- data --------------------------------------------------;---------------- data --------------------------------------------------;---------------- data --------------------------------------------------;---------------- data --------------------------------------------------
-old_mode     db 0
-forced       db 0
-adapter      db 0
-mode_num     db 12h
-planar       dw 0
-vseg         dw 0B800h
-bank_mask    dw 1
-yshift       db 1
-row_bytes    dw 80
-text_cols    db 80
-text_rows    db 25
-body         db 24
-vram_size    dw 9600h
-text_color   db 7
-line_color   db 7
-cur_col      db 0
-cur_row      db 0
-cell_upper   db 0
-cell_tall    db 0
-cell_has     db 0
-exp_prev     db 0                    ; last base was expanded (marks shift by 2)
-back         db 0
-chr          db 0
-hl_y         dw 0
-pg_x         dw 0
-pg_y         dw 0
-pg_src       dw 0
-pg_ycur      dw 0
-pg_rowbyte   db 0
-cell_buf     db CELLH dup (0)
-cell_tmp    db CELLH dup (0)
-style_reg    db 0
-test_mode    db 0
-scr_px       dw 640
-cell_wide    db 40 dup (0)
-
-have_file    db 0
-handle       dw 0
-ku_mode      db 0                    ; default TIS-620 (c toggles KU for RW files)
-top          dw 0
-topmax       dw 0
-hshift       dw 0
-maxh         dw 0
-nlines       dw 0
-maxlen       dw 80
-curlen       dw 0
-bidx         dw 0
-boff         dw 0
-blk_used     dw 0
-blk_seg      dw MAXBLK dup (0)
-dl_row       db 0
-dl_seg       dw 0
-dl_off       dw 0
-fname        db 66 dup (0)
-open_err     dw 0
-status_buf   db 96 dup (0)
-status_shadow db 96 dup (0)
-r_b0         dw 0                    ; R-digit span: byte offsets in buf,
-r_b1         dw 0                    ; column span on screen (0-based px),
-r_c0         dw 0                    ; sh_rc1 = previous right edge for
-r_c1         dw 0                    ; partial repaints
-sh_rc1       dw 0
-inv_flag     db 0
-sb_delta     dw 0
-vrow_tab     times 512 dw 0
-vrt_val      times 4 dw 0
-help_mode    db 0
-build_start  dw 0
-lin_base     dw lin_tab              ; active line table (file or help)
-lin_cap      dw LINEMAX              ; active table capacity (entries)
-help_nlines  dw 0                    ; help doc line count (built once)
-help_built   db 0
-sv_top       dw 0
-sv_hshift    dw 0
-sv_ku        db 0
-sv_blkused   db 0
-sv_nlines    dw 0
-sv_maxlen    dw 0
-sv_blkseg    dw MAXBLK dup (0)
-sv_fname     db 66 dup (0)
-help_lin_tab db HELP_LINEMAX*4 dup (0)
+; status bar template: 01 = file name, 03 = hshift, 04 = R digits, 06 = KU/TIS
+st_tpl: db 02h, 01h, 02h, ' ', 02h, "C:", 02h, 03h, ' ', 02h, "R:", 02h, 04h, ' ', 02h, 06h, 02h, 0
 
 %include "STRS.INC"
 %include "KU.INC"
 %include "STATUS.INC"
 
-hgc_crtc:                             ; 6845 R0..R11 for 720x348 gfx
-        db 35h, 2Dh, 2Eh, 07h, 5Bh, 02h, 57h, 57h, 02h, 03h, 00h, 00h
+packed: incbin "packed.bin"           ; AXV.FON + HELP.TXT, run-length packed
 
-font8x19:
-        incbin "AXV.FON"
-
-help_data:
-        incbin "HELP.TXT"             ; WordStar-style help source (TIS-620 +
-                                      ; ^B/^E/^L/^S/^N/^V/^W style codes), edit
-                                      ; in any DOS editor and just rebuild
-        db 0                          ; blob terminator
-lin_tab      equ $                    ; line table grows upward from here, < 0xF000
+;---------------- uninitialised data (zeroed at start) -------------------
+        section .bss
+bss_start:
+font8x19    resb FONT_LEN             ; 256 glyphs x 19 rows
+help_data   resb HELP_LEN             ; help text (TIS-620 + style codes) + 0
+cls         resb 256                  ; byte class per raw byte
+trc         resw 256                  ; class<<8 | translated char (KU aware)
+vrow_tab    resw 512                  ; VRAM offset of every scanline
+gofs        resw 256                  ; font glyph address per char
+tbl_hi      resb 256                  ; byte -> high nibble pixel-doubled
+tbl_lo      resb 256                  ; byte -> low nibble pixel-doubled
+dk_tab      resb 256                  ; detect_ku byte classes
+vrt_val     resw 4
+cell_buf    resb CELLH                ; composed cell (base | marks)
+cell_tmp    resb CELLH                ; styled copy
+cell_wide   resb CELLH*2              ; pixel-doubled cell
+numbuf      resb 16
+fname       resb 66
+help_lin_tab resb HELP_LINEMAX*4
+; --- mode parameters (filled from vparm, keep the order) ---
+mode_num    resb 1
+vseg        resw 1
+bank_mask   resw 1
+row_bytes   resw 1
+text_cols   resb 1
+body        resb 1                    ; body rows (status is row 0)
+vram_size   resw 1
+planar      resb 1
+; --- viewer state; top..ku_mode is saved/restored around the help ---
+top         resw 1
+hshift      resw 1
+nlines      resw 1
+maxlen      resw 1
+ku_mode     resw 1
+sv_top      resw 5
+topmax      resw 1
+maxh        resw 1
+blk0        resw 1                    ; first / one-past-last text block
+blk_end     resw 1
+build_start resw 1
+lin_base    resw 1                    ; active line table (file or help)
+lin_lim     resw 1                    ; one past the last table entry
+help_nlines resw 1
+open_err    resw 1
+sb_delta    resw 1
+cur_y2      resw 1                    ; cur_row*19*2
+cell_src    resw 1                    ; font glyph or cell_buf
+dl_seg      resw 1
+dl_off      resw 1
+dl_vrow     resw 1                    ; VRAM offset of the current row
+dl_vdi      resw 1                    ; VRAM address of the current cell
+old_mode    resb 1
+forced      resb 1
+adapter     resb 1
+test_mode   resb 1
+have_file   resb 1
+help_mode   resb 1
+help_built  resb 1
+cur_col     resb 1
+cur_row     resb 1
+cell_has    resb 1
+exp_prev    resb 1                    ; last base was expanded
+back        resb 1
+style_reg   resb 1
+inv_flag    resb 1                    ; 0 / FFh xor mask
+dl_row      resb 1
+r_c0        resb 1                    ; status: column / length of R digits
+r_len       resb 1
+            alignb 2
+bss_end:
+lin_tab     equ bss_end               ; line table grows upward from here
+LIN_LIM     equ 0F000h                ; ... up to here (stack lives above)
