@@ -57,7 +57,7 @@ Measured against the original build (`read_orig.com`, 15,349 bytes):
 
 | Metric | Original | Optimized | Improvement |
 |---|---:|---:|---:|
-| Binary size | 15,349 B | 7,384 B | **51.9% smaller (2.08×)** |
+| Binary size | 15,349 B | 7,525 B | **51.0% smaller (2.04×)** |
 | Startup + first draw (cycles) | ~6.0–7.9 M | ~2.2–3.3 M | **~2.4–2.7× faster** |
 | Redraw per keypress (cycles) | ~1.3–2.1 M | ~0.36–0.89 M | **~2.3–4.7× faster** |
 
@@ -112,3 +112,14 @@ Along the way the rewrite also fixes latent bugs present in the original:
    (which drew stray marks at column 0).
 5. Minor last-column / wide-glyph wrap guards and `ESC`-stripping consistency
    between the loader and the renderer.
+6. **Embedded `00` bytes no longer truncate the file.** The original treated
+   any literal `00` byte inside the file's content as end-of-text — both when
+   counting lines and when drawing them — so a real-world document that uses
+   `00` bytes as filler glyphs (e.g. a box-drawing table row) got cut off far
+   short of its real end. `00` is now just another swallowed control byte;
+   only `0D`/`0A` end a line, `1A` (`^Z`) keeps its conventional end-of-file
+   meaning, and a single recorded "true end of loaded text" position (set once
+   by the loader) is what actually stops scanning/drawing — not the value of
+   any particular byte.
+7. **`/t` selftest no longer waits 15 seconds.** It now shows its result and
+   returns to DOS as soon as any key is pressed.

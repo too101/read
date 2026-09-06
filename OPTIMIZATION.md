@@ -18,7 +18,7 @@ scrolling.
 
 | Metric | Original | Optimized | Improvement |
 |---|---:|---:|---:|
-| Binary size (`read.com`) | 15,349 B | **7,384 B** | **51.9% smaller (2.08×)** |
+| Binary size (`read.com`) | 15,349 B | **7,525 B** | **51.0% smaller (2.04×)** |
 | Startup + first full draw | ~6.0–7.9 M cyc | ~2.2–3.3 M cyc | **~2.4–2.7× faster** |
 | Redraw per keypress (avg) | ~1.3–2.1 M cyc | ~0.36–0.89 M cyc | **~2.3–4.7× faster** |
 
@@ -215,11 +215,54 @@ Minor guards so a wide glyph at the last visible column never wraps to the next
 scanline, and so the `ESC` intro byte is stripped identically by the loader and
 by the renderer.
 
+### 5.6 Embedded `00` bytes truncated the file *(reported after initial release)*
+
+The original — and, unnoticed, the first pass of this rewrite — treated the
+literal byte value `00` (and `1A`) inside the file's content as end-of-text,
+checked directly against the byte value rather than its position. Real-world
+documents that use `00` as a filler/box-drawing glyph mid-line (a table row
+built from repeated `00` bytes, for example) were cut off far short of their
+true end, both in the line count and in what got drawn.
+
+The fix separates two different questions that the value check had conflated:
+"where does the loaded text actually end" and "what does this particular byte
+mean". The loader now records a single `buf_end_seg:buf_end_off` position —
+the true end of what was actually read from disk — once, when the file (or the
+built-in help text) is loaded. `RDCH`, `peek`, and `build_lines` all check
+*position* against that marker to know when they've run out of text; no byte
+value is special-cased for that purpose any more. Separately, `00` was
+reclassified from "terminator" to "swallowed control" in the byte-class table,
+so it now behaves like any other invisible control code instead of ending
+anything. `1A` (`^Z`) keeps its original terminator classification — it is the
+conventional DOS end-of-text marker, and treating it as ordinary content
+regressed pixel-exact output on several fuzz-generated files during
+verification, for no benefit real files need.
+
+Verified against a real user-submitted document containing ~195 embedded `00`
+bytes: the line count went from stopping at line 30 to reaching the file's
+true last line.
+
+*(While verifying this fix, an unrelated latent bug was also found and fixed:
+`redraw` loaded the row count with a byte-only `mov cl,[body]` before a `loop`
+instruction, which tests the full 16-bit `CX`. It happened to work only
+because whatever ran before `redraw` coincidentally left the high byte zero;
+a `build_lines` change added while fixing the `00` issue stopped leaving it
+zero, which turned every screen redraw into thousands of extra loop
+iterations — 47–120× more instructions per file open, and outright timeouts
+in CGA/Hercules modes. Fixed with an explicit `xor ch,ch`, matching the
+already-safe pattern used at the other call site of the same routine.)*
+
+### 5.7 `/t` selftest delay removed
+
+The selftest screen used to hold for a fixed ~15 seconds (a BIOS tick-count
+poll) before returning to DOS. It now waits for any keypress instead, so it
+can be dismissed immediately.
+
 ---
 
 ## 6. Memory footprint
 
-- **On disk:** 7,384 bytes (from 15,349).
+- **On disk:** 7,525 bytes (from 15,349).
 - **At runtime:** the BSS adds ~9.6 KB, zeroed at startup — glyph and class
   tables, the scanline LUT, cell buffers, viewer state, and the line table.
 - **File buffers and line table** are unchanged in spirit: up to 8×64 KB blocks

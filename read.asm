@@ -29,14 +29,28 @@ HELP_LINEMAX equ 32                  ; help table capacity (help doc is tiny)
 VPARM_SZ equ 12
 
 ; byte classes (cls table)
-C_TERM  equ 01h                      ; 00 0A 0D 1A
+C_TERM  equ 01h                      ; 0A 0D (real line breaks only; the
+                                      ; true end of loaded text is tracked
+                                      ; separately via buf_end_seg/off, see
+                                      ; RDCH/peek -- 00/1A are content bytes
+                                      ; that must not truncate a file, so
+                                      ; they classify as C_SWAL below)
 C_SWAL  equ 02h                      ; invisible controls, eat nothing
 C_STYLE equ 04h                      ; WordStar style toggles
 C_COMB  equ 08h                      ; combining mark (upper or lower)
 
 ; read next byte of the line: ES:SI -> AL = translated char, AH = class
+; (at the recorded true end of loaded text: report as if a terminator was
+;  read, whatever byte value physically follows in memory)
 %macro  RDCH 0
-        mov     al, [es:si]
+        mov     bx, es
+        cmp     bx, [buf_end_seg]
+        jne     %%rd
+        cmp     si, [buf_end_off]
+        jne     %%rd
+        mov     ah, C_TERM
+        jmp     %%done
+%%rd:   mov     al, [es:si]
         inc     si
         jnz     %%ok
         mov     bx, es               ; the line runs into the next block
@@ -46,6 +60,7 @@ C_COMB  equ 08h                      ; combining mark (upper or lower)
         mov     bx, ax
         shl     bx, 1
         mov     ax, [trc+bx]
+%%done:
 %endmacro
 
 ;=======================================================================
@@ -229,6 +244,13 @@ enter_help:
         mov     di, sv_top
         mov     cx, 5
         rep     movsw
+        mov     ax, [buf_end_seg]    ; save/replace the file's true-end
+        mov     [sv_buf_end_seg], ax ; marker with the help text's own
+        mov     ax, [buf_end_off]
+        mov     [sv_buf_end_off], ax
+        mov     ax, ds
+        mov     [buf_end_seg], ax
+        mov     word [buf_end_off], help_data+HELP_LEN
         mov     [blk0], ds           ; help bytes live in CS
         mov     ax, ds
         add     ax, 1000h
@@ -264,6 +286,10 @@ exit_help:
         mov     di, top
         mov     cx, 5
         rep     movsw
+        mov     ax, [sv_buf_end_seg]
+        mov     [buf_end_seg], ax
+        mov     ax, [sv_buf_end_off]
+        mov     [buf_end_off], ax
         call    set_blk
         mov     cl, [ku_mode]
         call    set_ku
@@ -510,6 +536,8 @@ dr_ok:
 redraw: mov     byte [r_len], 0      ; forces a full status bar
         mov     al, 1                ; body starts below the status row
         mov     cl, [body]
+        xor     ch, ch               ; CH must not carry stale bits into
+                                      ; draw_rows' "loop" (full CX, not CL)
         call    draw_rows
         ; fall through into st_refresh (r_len = 0 forces the full bar)
 
@@ -817,7 +845,14 @@ dl_cnt: cmp     byte [cur_col], 255  ; off-screen base: count only
         jmp     dl_ovf
 
 ; peek: AL/AH = translated char/class at ES:SI (no advance)
-peek:   mov     al, [es:si]
+peek:   mov     bx, es
+        cmp     bx, [buf_end_seg]
+        jne     pk_rd
+        cmp     si, [buf_end_off]
+        jne     pk_rd
+        mov     ah, C_TERM           ; true end of loaded text
+        ret
+pk_rd:  mov     al, [es:si]
         xor     ah, ah
         mov     bx, ax
         shl     bx, 1
@@ -1150,11 +1185,16 @@ lf_r:   push    ds
         mov     ds, si
         mov     word [0FFFEh], 0
         pop     ds
-        jmp     lf_close
+        mov     [buf_end_seg], si    ; record the true end (not just the
+        mov     word [buf_end_off], 0FFFEh  ; sentinel byte) build_lines/
+        jmp     lf_close                    ; draw_line stop at
 lf_sh:  mov     di, ax               ; short read: terminate here
         add     di, dx
         mov     byte [di], 0
+        mov     bx, ds               ; DS = block segment; save before pop
         pop     ds
+        mov     [buf_end_seg], bx
+        mov     [buf_end_off], di
 lf_close:
         mov     ah, 3Eh
         int     21h
@@ -1181,7 +1221,12 @@ build_lines:
         add     di, 4                ; DI = next table entry
         xor     bx, bx
         xor     dx, dx               ; DL = columns in this line (caps at 255)
-bl_l:   mov     al, [es:si]
+bl_l:   mov     cx, es               ; true end of loaded text? (00/1A inside
+        cmp     cx, [buf_end_seg]    ; the file are ordinary content, not
+        jne     bl_rd                ; EOF -- only this recorded position is)
+        cmp     si, [buf_end_off]
+        je      bl_done
+bl_rd:  mov     al, [es:si]
         inc     si
         jz      bl_wrap
 bl_c:   mov     bl, al
@@ -1202,12 +1247,12 @@ bl_sp:  test    ah, C_TERM
         test    ah, C_STYLE          ; style codes count (as in TREAD),
         jnz     bl_cnt               ; marks/controls don't
         jmp     bl_l
-bl_term:
+bl_term:                             ; 0D/0A/1A carry C_TERM now
         cmp     al, 0Dh
         je      bl_cr
         cmp     al, 0Ah
         je      bl_lf
-        jmp     bl_done              ; 00 / 1A: end of text
+        jmp     bl_done              ; 1A (^Z): stop scanning here, like EOF
 bl_cr:  cmp     byte [es:si], 0Ah    ; CR LF = one break
         jne     bl_lf
         call    adv
@@ -1291,16 +1336,8 @@ selftest:
         mov     byte [cur_col], 0
         mov     si, s_ok
         call    puts
-        mov     cx, 273              ; wait 15s via BIOS tick counter (18.2/s)
-        push    ds
-        xor     ax, ax
-        mov     ds, ax
-        mov     bx, [46Ch]
-        add     bx, cx
-st_d1:  mov     ax, [46Ch]
-        cmp     ax, bx
-        jb      st_d1
-        pop     ds
+        xor     ah, ah               ; "press a key": wait, no 15s timer
+        int     16h
         ret
 st_line:
         mov     cx, 1
@@ -1469,7 +1506,12 @@ sw_chars: db "vceht"
 sw_adap:  db 2, 0, 1, 3
 
 ; byte classes for 00h-1Fh
-cls_lo: db C_TERM, C_SWAL, C_STYLE, C_SWAL, C_SWAL, C_STYLE, C_SWAL, C_SWAL
+; 00 is a content byte some real files embed mid-line (e.g. a table row
+; built from filler/box glyphs) -- swallow it like any other control
+; instead of treating it as end-of-file; only 0D/0A end a line, 1A (^Z)
+; keeps its conventional "rest of file is not real content" meaning, and
+; buf_end_seg/off (see RDCH) ends the text.
+cls_lo: db C_SWAL, C_SWAL, C_STYLE, C_SWAL, C_SWAL, C_STYLE, C_SWAL, C_SWAL
         db 0, 0, C_TERM, 0, 0, C_TERM, C_STYLE, C_STYLE
         db 0, 0, C_STYLE, C_STYLE, C_STYLE, C_STYLE, C_STYLE, C_STYLE
         db 0, 0, C_TERM, C_SWAL, C_SWAL, C_SWAL, C_SWAL, C_SWAL
@@ -1533,11 +1575,15 @@ nlines      resw 1
 maxlen      resw 1
 ku_mode     resw 1
 sv_top      resw 5
+sv_buf_end_seg resw 1                 ; saved across the help overlay
+sv_buf_end_off resw 1
 topmax      resw 1
 maxh        resw 1
 blk0        resw 1                    ; first / one-past-last text block
 blk_end     resw 1
 build_start resw 1
+buf_end_seg resw 1                    ; true end of loaded text (seg:off) --
+buf_end_off resw 1                    ; authoritative, not a sentinel byte
 lin_base    resw 1                    ; active line table (file or help)
 lin_lim     resw 1                    ; one past the last table entry
 help_nlines resw 1
