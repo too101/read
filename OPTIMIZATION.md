@@ -18,7 +18,7 @@ scrolling.
 
 | Metric | Original | Optimized | Improvement |
 |---|---:|---:|---:|
-| Binary size (`read.com`) | 15,349 B | **7,525 B** | **51.0% smaller (2.04×)** |
+| Binary size (`read.com`) | 15,349 B | **7,637 B** | **50.2% smaller (2.01×)** |
 | Startup + first full draw | ~6.0–7.9 M cyc | ~2.2–3.3 M cyc | **~2.4–2.7× faster** |
 | Redraw per keypress (avg) | ~1.3–2.1 M cyc | ~0.36–0.89 M cyc | **~2.3–4.7× faster** |
 
@@ -258,11 +258,36 @@ The selftest screen used to hold for a fixed ~15 seconds (a BIOS tick-count
 poll) before returning to DOS. It now waits for any keypress instead, so it
 can be dismissed immediately.
 
+### 5.8 Tab (`09`) now expands to 8 spaces
+
+Previously a literal tab byte fell through to the plain-glyph path like any
+other unclassified byte, drawing whatever font glyph happens to sit at index
+9 (garbage) and counting as a single column. It is now a distinct byte class
+(`C_TAB`) that expands to 8 real space characters.
+
+Rendering one input byte as 8 output cells doesn't fit the "one call reads
+one byte" shape of `RDCH` (the per-character reader used throughout
+`draw_line`), so the macro now tracks how many synthetic spaces are still
+owed in a one-byte counter, `tab_run`: the first read of a `09` consumes it
+from the buffer once, sets `tab_run = 7`, and returns a plain space for this
+call; the next 7 calls return plain spaces without touching the buffer at
+all, decrementing `tab_run` each time; the 9th call resumes reading real
+bytes from the (already-correct) position. Every one of those 8 synthetic
+reads is indistinguishable from a real space to the rest of `draw_line` —
+same class, same font glyph, subject to the same active style — so a tab
+under an active "expanded" style widens exactly like 8 real spaces would.
+`build_lines` (which only counts columns, not pixels) doesn't need the
+multi-step expansion — it just adds 8 to the running column count in one
+step, saturating at the existing 255-column cap.
+
+Verified pixel-identical against 8 literal space characters in the same
+position, in every video mode.
+
 ---
 
 ## 6. Memory footprint
 
-- **On disk:** 7,525 bytes (from 15,349).
+- **On disk:** 7,637 bytes (from 15,349).
 - **At runtime:** the BSS adds ~9.6 KB, zeroed at startup — glyph and class
   tables, the scanline LUT, cell buffers, viewer state, and the line table.
 - **File buffers and line table** are unchanged in spirit: up to 8×64 KB blocks

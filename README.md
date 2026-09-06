@@ -57,7 +57,7 @@ Measured against the original build (`read_orig.com`, 15,349 bytes):
 
 | Metric | Original | Optimized | Improvement |
 |---|---:|---:|---:|
-| Binary size | 15,349 B | 7,525 B | **51.0% smaller (2.04×)** |
+| Binary size | 15,349 B | 7,637 B | **50.2% smaller (2.01×)** |
 | Startup + first draw (cycles) | ~6.0–7.9 M | ~2.2–3.3 M | **~2.4–2.7× faster** |
 | Redraw per keypress (cycles) | ~1.3–2.1 M | ~0.36–0.89 M | **~2.3–4.7× faster** |
 
@@ -123,3 +123,6 @@ Along the way the rewrite also fixes latent bugs present in the original:
    any particular byte.
 7. **`/t` selftest no longer waits 15 seconds.** It now shows its result and
    returns to DOS as soon as any key is pressed.
+8. **Tab (`09`) now expands to 8 spaces** instead of drawing as a stray font
+   glyph. It's pixel-identical to typing 8 literal spaces in its place, and
+   counts as 8 columns for line-length/horizontal-scroll purposes too.

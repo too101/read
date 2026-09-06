@@ -38,12 +38,20 @@ C_TERM  equ 01h                      ; 0A 0D (real line breaks only; the
 C_SWAL  equ 02h                      ; invisible controls, eat nothing
 C_STYLE equ 04h                      ; WordStar style toggles
 C_COMB  equ 08h                      ; combining mark (upper or lower)
+C_TAB   equ 10h                      ; 09 (tab): expands to 8 spaces
 
 ; read next byte of the line: ES:SI -> AL = translated char, AH = class
 ; (at the recorded true end of loaded text: report as if a terminator was
-;  read, whatever byte value physically follows in memory)
+;  read, whatever byte value physically follows in memory. A real 09 byte
+;  is consumed once but reported back as 8 separate plain-space reads --
+;  [tab_run] counts how many of those 8 are still owed.)
 %macro  RDCH 0
-        mov     bx, es
+        cmp     byte [tab_run], 0
+        je      %%chk
+        dec     byte [tab_run]
+        mov     ax, [trc+40h]        ; trc[' '] -- always class 0, plain space
+        jmp     %%done
+%%chk:  mov     bx, es
         cmp     bx, [buf_end_seg]
         jne     %%rd
         cmp     si, [buf_end_off]
@@ -60,6 +68,10 @@ C_COMB  equ 08h                      ; combining mark (upper or lower)
         mov     bx, ax
         shl     bx, 1
         mov     ax, [trc+bx]
+        test    ah, C_TAB
+        jz      %%done
+        mov     byte [tab_run], 7    ; this read + 7 more = 8 spaces total
+        mov     ax, [trc+40h]
 %%done:
 %endmacro
 
@@ -728,6 +740,7 @@ hn1:    mov     [di], al
 draw_line:
         mov     byte [style_reg], 0  ; styles are line-local
         mov     byte [exp_prev], 0
+        mov     byte [tab_run], 0    ; no tab expansion owed at line start
         mov     al, [dl_row]
         call    set_row
         mov     bx, [cur_y2]
@@ -1246,6 +1259,15 @@ bl_sp:  test    ah, C_TERM
         jnz     bl_term
         test    ah, C_STYLE          ; style codes count (as in TREAD),
         jnz     bl_cnt               ; marks/controls don't
+        test    ah, C_TAB            ; tab = 8 columns at once (RDCH expands
+        jnz     bl_tab               ; it to 8 draws; count needs to match)
+        jmp     bl_l
+bl_tab: mov     al, dl
+        add     al, 8
+        jnc     bl_tabok
+        mov     al, 255              ; saturate, same rule as bl_cnt's wrap
+bl_tabok:
+        mov     dl, al
         jmp     bl_l
 bl_term:                             ; 0D/0A/1A carry C_TERM now
         cmp     al, 0Dh
@@ -1510,9 +1532,10 @@ sw_adap:  db 2, 0, 1, 3
 ; built from filler/box glyphs) -- swallow it like any other control
 ; instead of treating it as end-of-file; only 0D/0A end a line, 1A (^Z)
 ; keeps its conventional "rest of file is not real content" meaning, and
-; buf_end_seg/off (see RDCH) ends the text.
+; buf_end_seg/off (see RDCH) ends the text. 09 (tab) expands to 8 spaces
+; (RDCH does the expansion; build_lines counts it as 8 columns directly).
 cls_lo: db C_SWAL, C_SWAL, C_STYLE, C_SWAL, C_SWAL, C_STYLE, C_SWAL, C_SWAL
-        db 0, 0, C_TERM, 0, 0, C_TERM, C_STYLE, C_STYLE
+        db 0, C_TAB, C_TERM, 0, 0, C_TERM, C_STYLE, C_STYLE
         db 0, 0, C_STYLE, C_STYLE, C_STYLE, C_STYLE, C_STYLE, C_STYLE
         db 0, 0, C_TERM, C_SWAL, C_SWAL, C_SWAL, C_SWAL, C_SWAL
 ; byte classes for D1h-EEh (Thai combining marks)
@@ -1584,6 +1607,7 @@ blk_end     resw 1
 build_start resw 1
 buf_end_seg resw 1                    ; true end of loaded text (seg:off) --
 buf_end_off resw 1                    ; authoritative, not a sentinel byte
+tab_run     resb 1                    ; RDCH: spaces still owed from a tab
 lin_base    resw 1                    ; active line table (file or help)
 lin_lim     resw 1                    ; one past the last table entry
 help_nlines resw 1
