@@ -7,13 +7,16 @@
 3. strips the 0x100h pad (NASM 3.x ignores 'org' in -f bin mode)
 
 Requires NASM in PATH (or set the NASM environment variable to its path).
-Output: read.com
+Output: output/read.com (the "output" folder is created next to this
+script / read.asm if it doesn't exist yet)
 """
 import os
 import subprocess
 import sys
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)) or ".")
+OUT_DIR = "output"
+os.makedirs(OUT_DIR, exist_ok=True)
 
 # ---- 1. pack font + help --------------------------------------------------
 font = open("AXV.FON", "rb").read()
@@ -63,6 +66,7 @@ if data[:0x100] != bytes(0x100) or data[0x100] != 0xFC:
     print("UNEXPECTED: first 0x100 bytes are not zero-padding or 0x100 is not 'cld'")
     sys.exit(1)
 final = data[0x100:]
-open("read.com", "wb").write(final)
+out_path = os.path.join(OUT_DIR, "read.com")
+open(out_path, "wb").write(final)
 os.remove("read_raw.com")
-print("read.com size=%d (0x%X)" % (len(final), len(final)))
+print("%s size=%d (0x%X)" % (out_path, len(final), len(final)))

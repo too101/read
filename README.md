@@ -1,128 +1,133 @@
-# READ.COM — Thai text reader for DOS (optimized)
+# READ.COM — โปรแกรมอ่านข้อความภาษาไทยสำหรับ DOS (ฉบับ optimize)
 
-Full-screen Thai text viewer written in 8086 assembly (NASM, `.COM`).
-Runs on CGA / EGA / VGA / Hercules, direct VRAM rendering, AXV 8×19 Thai font
-with WordStar-style inline attributes (bold, double-width, italic, underline,
-double underline, super/subscript), KU/TIS-620 auto-detect, built-in help.
+โปรแกรมดูข้อความภาษาไทยแบบเต็มจอ เขียนด้วย 8086 assembly (NASM, `.COM`)
+รันได้บน CGA / EGA / VGA / Hercules เขียน VRAM ตรง ๆ ใช้ฟอนต์ไทย AXV 8×19
+พร้อมแอตทริบิวต์แบบ WordStar (หนา, กว้างเป็น 2 เท่า, เอียง, ขีดเส้นใต้, ขีดเส้น
+ใต้คู่, ตัวยก/ตัวห้อย), ตรวจจับ KU/TIS-620 อัตโนมัติ, มีหน้า help ในตัว
 
-This is a size- and speed-optimized rewrite of the original `read.asm`. It is
-**pixel-for-pixel identical** to the original on real text, is **~52% smaller**,
-runs **~2.1–2.7× fewer cycles at startup and up to ~4.7× fewer per keypress**,
-and fixes several latent rendering bugs (see *Correctness & bug fixes* below).
+นี่คือเวอร์ชันที่เขียน `read.asm` ต้นฉบับใหม่เพื่อให้เล็กลงและเร็วขึ้น ให้
+พิกเซล **ตรงกันทุกจุด** กับต้นฉบับบนข้อความจริง **เล็กลง ~50%** ใช้ cycle
+**น้อยลง ~2.0–2.7 เท่าตอนเปิดโปรแกรม และน้อยลงสูงสุดถึง ~4.7 เท่าต่อการกดปุ่ม**
+และแก้บั๊กแฝงในการวาดจออีกหลายจุด (ดู *ความถูกต้องและบั๊กที่แก้* ด้านล่าง)
 
-## Files
+## ภาพหน้าจอ
 
-| File | Purpose |
+หน้า help ในตัว (กด F1) แสดงวิธีใช้และปุ่มลัดทั้งหมด:
+
+![หน้าจอ help ของ READ.COM](screenshot.png)
+
+## ไฟล์
+
+| ไฟล์ | หน้าที่ |
 |---|---|
-| `read.asm` | the whole program |
-| `STRS.INC` | strings + KU→TIS table label |
-| `KU.INC` | KU → TIS-620 translation table |
-| `STATUS.INC` | status bar labels |
-| `AXV.FON` | 8×19 Thai font, 256 glyphs (binary, packed at build) |
-| `HELP.TXT` | built-in help text (TIS-620 + style codes, packed at build) |
-| `build_read.py` | build script (packs data, runs NASM, strips the pad) |
+| `read.asm` | โปรแกรมทั้งหมด |
+| `STRS.INC` | สตริงต่าง ๆ + label ของตาราง KU→TIS |
+| `KU.INC` | ตารางแปลง KU → TIS-620 |
+| `STATUS.INC` | ป้ายข้อความของ status bar |
+| `AXV.FON` | ฟอนต์ไทย 8×19, 256 glyph (ไบนารี, ถูกบีบอัดตอน build) |
+| `HELP.TXT` | เนื้อหา help ในตัว (TIS-620 + รหัสสไตล์, ถูกบีบอัดตอน build) |
+| `build_read.py` | สคริปต์ build (บีบอัดข้อมูล, เรียก NASM, ตัด pad ทิ้ง) |
 
 ## Build
 
-Requires [NASM](https://nasm.us/) (2.x or 3.x).
+ต้องมี [NASM](https://nasm.us/) (2.x หรือ 3.x)
 
 ```
 python build_read.py
 ```
 
-The script first run-length packs `AXV.FON` + `HELP.TXT` into `packed.bin`
-(regenerated each build), assembles `read.asm`, and strips the 0x100h pad that
-NASM 3.x emits because it ignores `org` in `-f bin` mode. Output: `read.com`.
+สคริปต์จะบีบอัดแบบ run-length `AXV.FON` + `HELP.TXT` ลง `packed.bin` ก่อน
+(สร้างใหม่ทุกครั้งที่ build) แล้วเรียก NASM ประกอบ `read.asm` จากนั้นตัด pad
+ขนาด 0x100h ที่ NASM 3.x แปะไว้ทิ้ง (เพราะมันไม่สนใจ `org` ตอนใช้โหมด `-f bin`)
+ผลลัพธ์: `output/read.com` (สคริปต์จะสร้างโฟลเดอร์ `output/` ให้เองใต้ตำแหน่ง
+เดียวกับ `read.asm` ถ้ายังไม่มี)
 
-## Run
+## รันโปรแกรม
 
 ```
-READ filename            autodetect video card
-READ filename /v|/e|/c|/h   force VGA / EGA / CGA / Hercules
+READ filename            ตรวจจับการ์ดจอเอง
+READ filename /v|/e|/c|/h   บังคับ VGA / EGA / CGA / Hercules
 READ /t                  selftest
 ```
 
-## Keys
+## ปุ่มควบคุม
 
 ```
-Up/Dn        one line          PgUp/PgDn or Space/BS  one page
-Home/End     top/bottom        Left/Right             8 columns
-c            KU <-> TIS        r / R                  full screen redraw
-q or Esc     quit              F1                     built-in help
+Up/Dn        เลื่อนทีละบรรทัด      PgUp/PgDn หรือ Space/BS  เลื่อนทีละหน้า
+Home/End     บนสุด/ล่างสุด         Left/Right               เลื่อนแนวนอน 8 คอลัมน์
+c            สลับ KU <-> TIS       r / R                    วาดจอใหม่ทั้งหน้าจอ
+q หรือ Esc   ออกจากโปรแกรม         F1                       หน้า help ในตัว
 ```
 
-## Results
+## ผลลัพธ์
 
-Measured against the original build (`read_orig.com`, 15,349 bytes):
+วัดเทียบกับไบนารีต้นฉบับ (`read_orig.com`, 15,349 ไบต์):
 
-| Metric | Original | Optimized | Improvement |
+| ตัวชี้วัด | เดิม | Optimize แล้ว | ดีขึ้น |
 |---|---:|---:|---:|
-| Binary size | 15,349 B | 7,637 B | **50.2% smaller (2.01×)** |
-| Startup + first draw (cycles) | ~6.0–7.9 M | ~2.2–3.3 M | **~2.4–2.7× faster** |
-| Redraw per keypress (cycles) | ~1.3–2.1 M | ~0.36–0.89 M | **~2.3–4.7× faster** |
+| ขนาดไบนารี | 15,349 B | 7,637 B | **เล็กลง 50.2% (2.01×)** |
+| เปิดโปรแกรม + วาดจอครั้งแรก (cycle) | ~6.0–7.9 M | ~2.2–3.3 M | **เร็วขึ้น ~2.4–2.7×** |
+| วาดจอใหม่ต่อการกดปุ่ม (cycle) | ~1.3–2.1 M | ~0.36–0.89 M | **เร็วขึ้น ~2.3–4.7×** |
 
-Cycle counts are from an 8086 timing model over an instruction-accurate
-emulator (Unicorn), averaged across the help page and mixed Thai/TIS/KU
-content in every video mode.
+ตัวเลข cycle มาจากโมเดลจับเวลาแบบ 8086 บน emulator ที่แม่นระดับคำสั่ง
+(Unicorn) เฉลี่ยจากหน้า help และเนื้อหาไทย/TIS/KU ผสมกันในทุกโหมดจอ
 
-## How it was made faster and smaller
+## ทำให้เร็วขึ้นและเล็กลงได้อย่างไร
 
-- **256-entry class/translate table** (`trc`): one table lookup replaces the
-  long chains of `cmp`/`je` that classified every byte (terminator, style
-  toggle, combining mark, swallowed control) and applied KU→TIS translation.
-  Rebuilt only when the code page toggles.
-- **Inline fast path for plain glyphs**: an un-styled base character in a
-  planar mode (EGA/VGA) is blitted straight from the font to VRAM with an
-  unrolled `movsb` loop and a running VRAM pointer — no cell copy, no style
-  pass, no dispatch.
-- **Scanline LUT everywhere** (`vrow_tab`): one address table serves every
-  video mode (planar and interleaved), so the hot paths never multiply to find
-  a scanline.
-- **Word-wide fills and copies**: screen clears, the inverse status band, cell
-  composition and VRAM scrolling move two bytes at a time.
-- **Key-dispatch table** replaces the linear key `cmp` ladder.
-- **Packed data**: the font and help text ship run-length compressed
-  (6,164 → ~3,660 bytes) and are unpacked into the BSS at startup.
-- **Zero-initialised data in BSS**: all scratch/state is reserved (not stored
-  in the file) and cleared once at startup, cutting the on-disk image.
-- **Dead code removed**: the never-reached tone-composition path, the unused
-  cell-height flag, and other leftovers are gone.
+- **ตาราง class/translate 256 ช่อง** (`trc`): table lookup ครั้งเดียวแทนสาย
+  `cmp`/`je` ยาว ๆ ที่เคยใช้จัดคลาสทุกไบต์ (ตัวจบบรรทัด, ตัวสลับสไตล์,
+  สระ/วรรณยุกต์, ตัวควบคุมที่ต้องกลืน) และแปลง KU→TIS ไปด้วย rebuild ก็ต่อเมื่อ
+  สลับหน้ารหัสเท่านั้น
+- **Fast path แบบ inline สำหรับตัวอักษรธรรมดา**: ตัวฐานที่ไม่มีสไตล์ในโหมด
+  planar (EGA/VGA) ถูก blit จากฟอนต์ลง VRAM ตรง ๆ ด้วย loop `movsb` แบบ
+  unroll และตัวชี้ VRAM ที่วิ่งต่อเนื่อง — ไม่มีการ copy cell ไม่มีขั้นตอนใส่
+  สไตล์ ไม่มี dispatch
+- **ตาราง scanline LUT ใช้ทุกที่** (`vrow_tab`): ตารางที่อยู่เดียวใช้ได้ทุกโหมด
+  จอ (ทั้ง planar และ interleave) ทำให้ hot path ไม่ต้องคูณเลขหาสแกนไลน์อีก
+- **อ่าน/เขียนหน่วยความจำทีละ word**: การล้างจอ, แถบ status bar สีกลับ, การ
+  ประกอบ cell และการเลื่อนจอใน VRAM ย้ายข้อมูลทีละ 2 ไบต์
+- **ตาราง dispatch คีย์** แทนที่สายเช็ค `cmp` คีย์แบบเรียงลำดับ
+- **บีบอัดข้อมูล**: ฟอนต์และเนื้อหา help ถูกบีบอัดแบบ run-length
+  (6,164 → ~3,660 ไบต์) แล้วคลายลง BSS ตอนเปิดโปรแกรม
+- **ข้อมูลที่ zero ไว้ล่วงหน้าอยู่ใน BSS**: ตัวแปร/สถานะชั่วคราวทั้งหมดถูกจอง
+  พื้นที่ไว้ (ไม่ได้เก็บเป็นไบต์ในไฟล์) แล้วเคลียร์ครั้งเดียวตอนเปิดโปรแกรม
+  ลดขนาดไฟล์บนดิสก์
+- **ลบโค้ดที่ไม่ใช้ทิ้ง**: path การประกอบวรรณยุกต์ที่ไม่มีทางถูกเรียกถึง,
+  flag ความสูง cell ที่ไม่มีใครใช้ และของตกค้างอื่น ๆ ถูกลบออกหมด
 
-## Correctness & bug fixes
+## ความถูกต้องและบั๊กที่แก้
 
-Verified pixel-identical to a corrected reference across the built-in help, the
-KU/TIS translation tables, every video mode, and ~600 randomly generated files
-(mixed Thai bases, combining marks, all WordStar styles, long lines, odd line
-terminators, empty/one-line/no-EOL files, missing files), scrolling with every
-key.
+ตรวจสอบแล้วว่าพิกเซลตรงกับ reference ที่แก้บั๊กแล้วทุกจุด ครอบคลุมหน้า help
+ในตัว, ตารางแปล KU/TIS, ทุกโหมดจอ และไฟล์สุ่มสร้างอีก ~600 ไฟล์ (ผสมตัวอักษร
+ฐานไทย, สระ/วรรณยุกต์ซ้อนกัน, สไตล์แบบ WordStar ทุกแบบ, บรรทัดยาว, ตัวจบบรรทัด
+แปลก ๆ, ไฟล์ว่าง/บรรทัดเดียว/ไม่มี EOL, ไฟล์ที่ไม่มีอยู่จริง) เลื่อนดูด้วยทุก
+ปุ่ม
 
-Along the way the rewrite also fixes latent bugs present in the original:
+ระหว่างทางการเขียนใหม่ยังแก้บั๊กแฝงที่มีอยู่ในต้นฉบับไปด้วย:
 
-1. **Status bar corruption while scrolling.** When the visible line-range grew
-   a digit (e.g. `R:1-24` → `R:11-34` at line 11), the original's byte-by-byte
-   shadow-diff misaligned and repainted the *filename* columns with the wrong
-   glyphs — the doubled/garbled `\cw\CWi6.DOC` you could see when scrolling.
-   The rewrite repaints the digit columns only when the digit count is
-   unchanged, and does a clean full repaint otherwise.
-2. **Stale `exp_prev` after an expanded glyph**, which mis-placed a following
-   combining mark by one column.
-3. **Partial VRAM scroll** now redraws *all* newly-exposed rows (the original
-   redrew only one), so fast multi-line scrolls never leave stale rows.
-4. **`cur_col` no longer wraps** past 255 on pathological >255-column lines
-   (which drew stray marks at column 0).
-5. Minor last-column / wide-glyph wrap guards and `ESC`-stripping consistency
-   between the loader and the renderer.
-6. **Embedded `00` bytes no longer truncate the file.** The original treated
-   any literal `00` byte inside the file's content as end-of-text — both when
-   counting lines and when drawing them — so a real-world document that uses
-   `00` bytes as filler glyphs (e.g. a box-drawing table row) got cut off far
-   short of its real end. `00` is now just another swallowed control byte;
-   only `0D`/`0A` end a line, `1A` (`^Z`) keeps its conventional end-of-file
-   meaning, and a single recorded "true end of loaded text" position (set once
-   by the loader) is what actually stops scanning/drawing — not the value of
-   any particular byte.
-7. **`/t` selftest no longer waits 15 seconds.** It now shows its result and
-   returns to DOS as soon as any key is pressed.
-8. **Tab (`09`) now expands to 8 spaces** instead of drawing as a stray font
-   glyph. It's pixel-identical to typing 8 literal spaces in its place, and
-   counts as 8 columns for line-length/horizontal-scroll purposes too.
+1. **Status bar เพี้ยนตอนเลื่อนจอ** เมื่อช่วงบรรทัดที่แสดงมีจำนวนหลักเพิ่มขึ้น
+   (เช่น `R:1-24` → `R:11-34` ที่บรรทัด 11) การเทียบ shadow ทีละไบต์ของ
+   ต้นฉบับจะคลาดกันและวาดทับคอลัมน์ **ชื่อไฟล์** ด้วย glyph ผิด — เห็นเป็น
+   `\cw\CWi6.DOC` ซ้อนกันตอนเลื่อนจอ ตัวที่เขียนใหม่วาดใหม่แค่คอลัมน์ตัวเลขเมื่อ
+   จำนวนหลักไม่เปลี่ยน และวาดทั้งแถบใหม่สะอาด ๆ เมื่อจำนวนหลักเปลี่ยน
+2. **`exp_prev` ค้างหลังตัวอักษรขยาย** ทำให้สระ/วรรณยุกต์ที่ตามมาถูกวางเลื่อน
+   ไป 1 คอลัมน์
+3. **การเลื่อนจอบางส่วนใน VRAM** ตอนนี้วาดใหม่ *ทุก* แถวที่เพิ่งโผล่มา (เดิม
+   วาดแค่แถวเดียว) ทำให้การเลื่อนหลายบรรทัดเร็ว ๆ ไม่ทิ้งแถวเก่าค้างอีก
+4. **`cur_col` ไม่ล้นวนกลับ 0 อีกต่อไป** บนบรรทัดที่ยาวผิดปกติเกิน 255 คอลัมน์
+   (ซึ่งเดิมทำให้เกิดรอยขยะที่คอลัมน์ 0)
+5. การ์ดป้องกันเล็กน้อยเรื่องคอลัมน์สุดท้าย/glyph กว้าง และความสม่ำเสมอของการ
+   ตัด `ESC` ระหว่างตัวโหลดไฟล์กับตัววาดจอ
+6. **ไบต์ `00` แทรกกลางไฟล์ไม่ทำให้แสดงผลไม่จบอีกต่อไป** เดิมถือว่าไบต์ `00`
+   ตัวใดก็ตามในเนื้อหาไฟล์คือจุดจบข้อความ — ทั้งตอนนับบรรทัดและตอนวาด — ทำให้
+   เอกสารจริงที่ใช้ไบต์ `00` เป็น filler glyph (เช่น แถวตารางแบบตีเส้น) ถูกตัด
+   จบไปก่อนถึงจุดจบจริงมาก ตอนนี้ `00` เป็นแค่ไบต์ควบคุมที่ถูกกลืนเหมือนตัวอื่น
+   มีแค่ `0D`/`0A` เท่านั้นที่จบบรรทัด ส่วน `1A` (`^Z`) ยังคงความหมายจบไฟล์แบบ
+   ธรรมเนียมเดิมไว้ และมีตำแหน่ง "จุดจบจริงของเนื้อหาที่โหลดมา" ที่บันทึกไว้
+   ครั้งเดียว (โดยตัวโหลดไฟล์) เป็นตัวหยุดการอ่าน/วาดจริง — ไม่ใช่ค่าของไบต์
+   ตัวใดตัวหนึ่ง
+7. **Selftest (`/t`) ไม่รอ 15 วินาทีอีกต่อไป** ตอนนี้แสดงผลแล้วกลับสู่ DOS
+   ทันทีที่กดคีย์ใดก็ได้
+8. **Tab (`09`) ขยายเป็น 8 ช่องว่างแล้ว** แทนที่จะวาดเป็น glyph ขยะจากฟอนต์
+   ให้พิกเซลตรงกับการพิมพ์ช่องว่าง 8 ตัวจริง ๆ เป๊ะ และนับเป็น 8 คอลัมน์สำหรับ
+   ความยาวบรรทัด/การเลื่อนแนวนอนด้วยเช่นกัน

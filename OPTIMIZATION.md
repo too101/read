@@ -1,323 +1,314 @@
-# READ.COM — Optimization Report
+# READ.COM — รายงานผลการ Optimize
 
-**Subject:** Size and speed optimization of `read.asm`, an 8086 assembly Thai
-text reader for DOS (CGA / EGA / VGA / Hercules).
+**หัวข้อ:** ปรับ `read.asm` (โปรแกรมอ่านข้อความภาษาไทยสำหรับ DOS เขียนด้วย 8086
+assembly รองรับ CGA / EGA / VGA / Hercules) ให้เล็กลงและเร็วขึ้น
 
-**Goal (as requested):** make the code *as fast and as small as possible*
-(`ให้เร็วสุด เล็กสุด`), without changing what the user sees on screen.
+**เป้าหมาย (ตามที่ขอ):** ทำให้โค้ด *เร็วสุด เล็กสุด* โดยไม่เปลี่ยนสิ่งที่ผู้ใช้
+เห็นบนจอ
 
-**Outcome:** the optimized build is **51.9% smaller**, **~2.4–2.7× fewer cycles
-at startup** and **up to ~4.7× fewer cycles per keypress**, is **pixel-for-pixel
-identical** to a corrected reference on real text, and additionally **fixes five
-latent rendering bugs** — including the status-bar corruption reported during
-scrolling.
+**ผลลัพธ์:** ตัวที่ optimize แล้ว **เล็กลง 50.2%**, ใช้ cycle ตอนเปิดโปรแกรม
+**น้อยลง ~2.4–2.7 เท่า** และตอนวาดจอใหม่ต่อการกดปุ่ม **น้อยลงสูงสุดถึง ~4.7
+เท่า**, ให้พิกเซล **ตรงกันทุกจุด** กับ reference ที่แก้บั๊กแล้วบนข้อความจริง
+และยังพ่วง **แก้บั๊กแฝงในการวาดจออีก 5 จุด** — รวมถึงบั๊ก status bar เพี้ยนตอน
+เลื่อนที่มีการแจ้งเข้ามา
 
 ---
 
-## 1. Results at a glance
+## 1. สรุปผลแบบเร็ว
 
-| Metric | Original | Optimized | Improvement |
+| ตัวชี้วัด | เดิม | Optimize แล้ว | ดีขึ้น |
 |---|---:|---:|---:|
-| Binary size (`read.com`) | 15,349 B | **7,637 B** | **50.2% smaller (2.01×)** |
-| Startup + first full draw | ~6.0–7.9 M cyc | ~2.2–3.3 M cyc | **~2.4–2.7× faster** |
-| Redraw per keypress (avg) | ~1.3–2.1 M cyc | ~0.36–0.89 M cyc | **~2.3–4.7× faster** |
+| ขนาดไบนารี (`read.com`) | 15,349 B | **7,637 B** | **เล็กลง 50.2% (2.01×)** |
+| เปิดโปรแกรม + วาดจอครั้งแรก | ~6.0–7.9 M cyc | ~2.2–3.3 M cyc | **เร็วขึ้น ~2.4–2.7×** |
+| วาดจอใหม่ต่อการกดปุ่ม (เฉลี่ย) | ~1.3–2.1 M cyc | ~0.36–0.89 M cyc | **เร็วขึ้น ~2.3–4.7×** |
 
-Per-scenario cycle detail (8086 timing model, see §3):
+รายละเอียด cycle แยกตามสถานการณ์ (โมเดลจับเวลาแบบ 8086 ดู §3):
 
-| Scenario | Startup (orig → opt) | Per-keypress avg (orig → opt) |
+| สถานการณ์ | เปิดโปรแกรม (เดิม → optimize) | เฉลี่ยต่อการกดปุ่ม (เดิม → optimize) |
 |---|---|---|
-| Help page (VGA) | 6.03 M → 2.21 M (**2.7×**) | 1.69 M → 0.36 M (**4.7×**) |
-| Mixed Thai/styles (VGA) | 7.21 M → 2.89 M (**2.5×**) | 1.95 M → 0.83 M (**2.3×**) |
-| Mixed, KU→TIS toggle (VGA) | 5.38 M → 2.15 M (**2.5×**) | 1.32 M → 0.56 M (**2.4×**) |
-| Mixed (Hercules) | 7.86 M → 3.29 M (**2.4×**) | 2.15 M → 0.89 M (**2.4×**) |
-| KU-encoded file (VGA) | 7.43 M → 2.90 M (**2.6×**) | 2.02 M → 0.84 M (**2.4×**) |
+| หน้า help (VGA) | 6.03 M → 2.21 M (**2.7×**) | 1.69 M → 0.36 M (**4.7×**) |
+| เนื้อหาไทยผสมสไตล์ (VGA) | 7.21 M → 2.89 M (**2.5×**) | 1.95 M → 0.83 M (**2.3×**) |
+| เนื้อหาผสม, สลับ KU→TIS (VGA) | 5.38 M → 2.15 M (**2.5×**) | 1.32 M → 0.56 M (**2.4×**) |
+| เนื้อหาผสม (Hercules) | 7.86 M → 3.29 M (**2.4×**) | 2.15 M → 0.89 M (**2.4×**) |
+| ไฟล์เข้ารหัส KU (VGA) | 7.43 M → 2.90 M (**2.6×**) | 2.02 M → 0.84 M (**2.4×**) |
 
-The help page shows the largest per-keypress win (4.7×) because it is mostly
-plain glyphs, which now take the inline fast path (§4.2). Style-heavy content
-wins less per keypress but still ~2.3–2.4×.
-
----
-
-## 2. Constraints and approach
-
-The reader draws directly to video RAM in four different hardware layouts
-(VGA 640×480 and EGA 640×350 planar; CGA 640×200 and Hercules 720×348
-interleaved), decodes two Thai code pages (TIS-620 and Kasetsart-RW), and
-composes each cell from a base glyph plus stacked combining marks with seven
-WordStar-style inline attributes (bold, expand, italic, single/double underline,
-super/subscript). Every one of those paths had to keep producing the **exact
-same pixels**.
-
-The work therefore proceeded as: build a pixel-exact test harness first, freeze
-the original's output as a reference, rewrite, and gate every change on
-pixel-identical output plus a measured cycle count.
+หน้า help ได้กำไรต่อการกดปุ่มมากที่สุด (4.7×) เพราะส่วนใหญ่เป็นตัวอักษรพื้นฐาน
+ไม่มีสไตล์ ซึ่งตอนนี้วิ่งผ่าน fast path แบบ inline (§4.2) ส่วนเนื้อหาที่มีสไตล์
+เยอะได้กำไรน้อยกว่าแต่ก็ยังอยู่ที่ ~2.3–2.4×
 
 ---
 
-## 3. Verification harness
+## 2. ข้อจำกัดและแนวทาง
 
-An instruction-accurate 8086 emulator (Unicorn) runs the real `.COM` under a
-minimal DOS/BIOS shim (INT 21h file I/O, INT 16h keyboard, INT 10h video mode,
-plus the BDA bytes and the Hercules vsync port the detector probes). After each
-key it captures the framebuffer from the correct VRAM window for the active mode
-and de-interleaves CGA/Hercules banks into a canonical bitmap.
+โปรแกรมนี้เขียนลง VRAM ตรง ๆ ใน 4 รูปแบบฮาร์ดแวร์ที่ต่างกัน (VGA 640×480 และ
+EGA 640×350 แบบ planar; CGA 640×200 และ Hercules 720×348 แบบ interleave)
+ถอดรหัสภาษาไทย 2 code page (TIS-620 และ Kasetsart-RW) และประกอบแต่ละ cell จาก
+ตัวอักษรฐาน + สระ/วรรณยุกต์ที่ซ้อนกัน พร้อมแอตทริบิวต์แบบ WordStar อีก 7 แบบ
+(หนา, ขยาย, เอียง, ขีดเส้นใต้เดี่ยว/คู่, ตัวยก/ตัวห้อย) ทุกเส้นทางเหล่านี้ต้อง
+ให้ **พิกเซลออกมาเหมือนเดิมทุกประการ**
 
-- **Cycle model.** Each executed instruction is decoded (iced-x86) and charged
-  per the Intel 8086 timing table, including effective-address cost, taken vs.
-  not-taken branch penalty (resolved from the next executed address), and
-  per-iteration string-op cost. This is the source of the cycle figures above —
-  a hardware-representative proxy, not wall-clock.
-- **Reference.** The original binary was first captured with five known bugs
-  corrected (see §5), so the rewrite is compared against *intended* behavior
-  rather than replicating defects.
-- **Coverage.** Pixel-exact comparison across: the built-in help; the KU→TIS
-  translation table; all four video modes; and ~600 randomly generated files
-  (mixed Thai bases, stacked combining marks, every style toggle, long lines,
-  >255-column and >255-byte lines, CR / LF / CRLF / lone-CR terminators,
-  empty / one-line / no-EOL / missing files), each scrolled with every key.
-  Result: **identical everywhere**, except pathological >255-column lines where
-  the optimized version is *more* correct (§5.4).
-- **Partial-repaint audit.** Because the reference forces a full redraw after
-  each scroll (to sidestep the original's buggy incremental paths), a separate
-  test compares the optimized version's *incremental* scroll output — body and
-  status bar — against its own full redraw, at 40 scroll positions in every
-  mode. Result: **0 differences**, which is what proves the status-bar fix (§5.1).
+งานจึงทำตามลำดับ: สร้างระบบทดสอบแบบเทียบพิกเซลตรงเป๊ะก่อน แช่แข็งผลลัพธ์ของ
+ต้นฉบับไว้เป็น reference แล้วค่อยเขียนใหม่ โดยทุกการเปลี่ยนแปลงต้องผ่านทั้ง
+"พิกเซลตรงกัน" และ "วัด cycle ได้จริง" ก่อนถึงจะถือว่าใช้ได้
 
 ---
 
-## 4. What was changed
+## 3. ระบบทดสอบยืนยันผล
 
-### 4.1 Byte classification and code-page translation → one table lookup
+ใช้ emulator 8086 แบบ instruction-accurate (Unicorn) รัน `.COM` จริงภายใต้ชั้น
+จำลอง DOS/BIOS แบบย่อ (INT 21h สำหรับไฟล์, INT 16h สำหรับคีย์บอร์ด, INT 10h
+สำหรับโหมดวิดีโอ รวมถึงไบต์ BDA และพอร์ต vsync ของ Hercules ที่ตัวตรวจจับการ์ด
+อ่าน) หลังกดแต่ละคีย์จะจับภาพ framebuffer จากช่วง VRAM ที่ถูกต้องตามโหมดที่ใช้
+แล้วแปลง bank แบบ interleave ของ CGA/Hercules ให้เป็น bitmap มาตรฐานเดียวกัน
 
-The original classified every input byte with long chains of `cmp`/`je`: is it a
-line terminator? a style toggle? a swallowed control? a combining mark? — and
-separately ran KU→TIS translation through `xlat` with a guard. These chains ran
-in the hottest loops (line build, hshift skip, cell draw), several times per
-byte.
-
-The rewrite precomputes a 512-byte table `trc[256]` where each entry packs
-`class<<8 | translated_char`. One indexed load yields both the translated glyph
-code and its class flags (`C_TERM`, `C_SWAL`, `C_STYLE`, `C_COMB`). The table is
-rebuilt only when the code page toggles (the `c` key), not per byte.
-
-*Effect:* removes tens of compares per character from every rendering loop.
-
-### 4.2 Inline fast path for plain glyphs
-
-An un-styled base character in a planar mode (EGA/VGA) is the overwhelmingly
-common case. The original still routed it through the full pipeline: copy glyph
-to a cell buffer, copy to a temp, run the style pass, dispatch, then blit.
-
-The rewrite detects "plain base, no style active, planar, not inverse" and
-blits the 19-row glyph straight from the font to VRAM with an unrolled `movsb`
-loop and a running VRAM pointer (`add di,79` between scanlines). No cell copy,
-no style pass, no dispatch. Combining marks and styled runs fall back to the
-full path, which is preserved intact.
-
-*Effect:* this is the dominant reason the help page redraws 4.7× faster.
-
-### 4.3 One scanline-address table for every mode
-
-The original computed scanline addresses differently per mode — a multiply for
-planar, a LUT for interleaved — duplicated across the draw, scroll, erase and
-band routines.
-
-The rewrite builds `vrow_tab[512]` once at startup (the VRAM offset of every
-scanline, already accounting for CGA/Hercules bank interleave) and every drawing
-routine indexes it. No multiplies on the hot paths, and one code path serves all
-four modes, which also shrinks the binary.
-
-### 4.4 Word-wide memory operations
-
-Screen clear, the inverse status band, cell composition (base OR mark), and the
-VRAM scroll blit now move two bytes per iteration (`stosw`/`movsw`) instead of
-one, halving the loop count on the biggest memory movers.
-
-### 4.5 Key dispatch table
-
-The keyboard handler's linear ladder of `cmp al,<key>` / `je <handler>` became a
-single table: normalize the key, `scasb` into a key list, and `jmp [table+bx]`.
-Smaller and constant-time.
-
-### 4.6 Packed data with a startup unpacker
-
-`AXV.FON` (4,864 B) and `HELP.TXT` (1,300 B effective) are stored run-length
-compressed in the binary (**6,164 → 3,658 B**) and unpacked into the BSS at
-startup by a tiny decoder (`00 <len> <byte>` = run, else literal). The help text
-is also trimmed at its first terminator during packing, dropping trailing
-garbage that was previously shipped verbatim.
-
-### 4.7 Zero-initialized state moved to BSS
-
-All scratch and mutable state (tables, cell buffers, viewer state, the line
-table) is now `resb`/`resw` in a `.bss` section rather than initialized bytes in
-the file. It is zeroed in one pass at startup. This removes several kilobytes of
-zero bytes from the on-disk image.
-
-### 4.8 Dead code removed
-
-The never-reached tone-composition routine and its "snug shift" helper, the
-unused cell-height flag and its setter, a redundant per-cell buffer copy, and
-assorted leftover state were deleted.
+- **โมเดลนับ cycle** ทุกคำสั่งที่รันจะถูกถอดรหัส (ด้วย iced-x86) แล้วคิดเวลาตาม
+  ตารางจับเวลาของ Intel 8086 จริง รวมค่าใช้จ่ายของ effective-address, ค่าปรับ
+  กรณี branch taken/not-taken (คำนวณจากที่อยู่คำสั่งถัดไปที่รันจริง) และค่าใช้
+  จ่ายต่อรอบของคำสั่งกลุ่ม string ตัวเลข cycle ทั้งหมดข้างต้นมาจากตรงนี้ — เป็น
+  ตัวแทนที่ใกล้เคียงฮาร์ดแวร์จริง ไม่ใช่เวลานาฬิกาจริง (wall-clock)
+- **Reference** ไบนารีต้นฉบับถูกจับภาพผลลัพธ์ไว้หลังแก้บั๊กที่รู้แล้ว 5 จุด
+  (ดู §5) ก่อน ดังนั้นตัวที่เขียนใหม่จะถูกเทียบกับพฤติกรรม *ที่ตั้งใจจะให้เป็น*
+  ไม่ใช่เทียบกับบั๊กเดิม
+- **ขอบเขตการทดสอบ** เทียบพิกเซลตรงเป๊ะครอบคลุม: หน้า help ในตัว, ตารางแปล
+  KU→TIS, ทั้ง 4 โหมดจอ, และไฟล์สุ่มสร้างอีก ~600 ไฟล์ (ผสมตัวอักษรฐานไทย,
+  สระ/วรรณยุกต์ซ้อนกันหลายชั้น, สไตล์ทุกแบบ, บรรทัดยาว, บรรทัดเกิน 255
+  คอลัมน์/255 ไบต์, ตัวจบบรรทัดแบบ CR / LF / CRLF / CR เดี่ยว, ไฟล์ว่าง/บรรทัด
+  เดียว/ไม่มี EOL/ไฟล์ไม่มีอยู่จริง) แต่ละไฟล์เลื่อนดูด้วยทุกปุ่ม ผลลัพธ์:
+  **ตรงกันทุกจุด** ยกเว้นกรณีบรรทัดเกิน 255 คอลัมน์แบบผิดปกติ ซึ่งตัว
+  optimize แล้ว *ถูกต้องกว่า* (§5.4)
+- **ตรวจสอบการวาดซ่อมบางส่วน (partial repaint)** เนื่องจาก reference บังคับวาด
+  ใหม่ทั้งจอทุกครั้งที่เลื่อน (เพื่อเลี่ยงบั๊กของ path วาดซ่อมบางส่วนในต้นฉบับ)
+  จึงมีการทดสอบแยกอีกชุดที่เทียบผลลัพธ์การเลื่อนแบบ *วาดซ่อมบางส่วน* ของตัว
+  optimize แล้ว — ทั้งส่วน body และ status bar — กับผลของการวาดใหม่ทั้งจอของ
+  ตัวเอง ที่ 40 ตำแหน่งการเลื่อนในทุกโหมด ผลลัพธ์: **ไม่มีความต่างเลย** ซึ่งเป็น
+  สิ่งที่ยืนยันว่าการแก้บั๊ก status bar (§5.1) ถูกต้อง
 
 ---
 
-## 5. Bug fixes (behavioral corrections)
+## 4. สิ่งที่เปลี่ยน
 
-These are latent defects in the original that the rewrite corrects. Each is
-verified against the pixel-exact harness.
+### 4.1 การจัดคลาสไบต์และแปลงรหัสหน้ารหัส → table lookup ครั้งเดียว
 
-### 5.1 Status-bar corruption while scrolling *(the reported bug)*
+ต้นฉบับจัดคลาสไบต์ทุกตัวด้วยสาย `cmp`/`je` ยาว ๆ: เป็นตัวจบบรรทัดไหม? เป็นตัว
+สลับสไตล์ไหม? เป็นตัวควบคุมที่ต้องกลืนไหม? เป็นสระ/วรรณยุกต์ไหม? — แล้วยังแยก
+รันการแปล KU→TIS ผ่าน `xlat` พร้อม guard อีกที สายเช็คพวกนี้วิ่งอยู่ใน loop ที่
+ร้อนที่สุด (สร้างบรรทัด, ข้ามคอลัมน์ตอนเลื่อนแนวนอน, วาด cell) หลายครั้งต่อไบต์
 
-**Symptom:** scrolling a file until the visible line range gained a digit — e.g.
-`R:1-24` → `R:11-34` at line 11 — corrupted the **filename** portion of the
-status bar (the doubled/garbled `\cw\CWi6.DOC` visible on screen), and left the
-underline rule broken under the digits.
+ตัวที่เขียนใหม่คำนวณตาราง `trc[256]` ขนาด 512 ไบต์ล่วงหน้า แต่ละ entry อัด
+`class<<8 | translated_char` ไว้ในตัวเดียว การอ่านครั้งเดียวจึงได้ทั้งรหัส
+glyph ที่แปลแล้วและ flag คลาส (`C_TERM`, `C_SWAL`, `C_STYLE`, `C_COMB`) ตาราง
+นี้จะ rebuild ก็ต่อเมื่อสลับหน้ารหัส (กดปุ่ม `c`) เท่านั้น ไม่ใช่ทุกไบต์
 
-**Cause:** the original repainted the status bar by comparing the freshly built
-string against a saved "shadow" copy byte-by-byte and classifying each
-difference as inside or outside the changing digit span. When the digit *count*
-changed, every byte after that point shifted by one, so the comparison
-misaligned and flagged filename bytes as "changed" — then repainted them at the
-wrong screen columns.
+*ผล:* ตัดการเปรียบเทียบหลายสิบครั้งต่อตัวอักษรออกจากทุก loop ที่ใช้วาดจอ
 
-**Fix:** the rewrite tracks only the digit field's *length*. If the length is
-unchanged (e.g. `12-35` → `13-36`), it repaints just the digit columns; if the
-length changed (e.g. `1-24` → `11-34`), it does a clean full-bar repaint. The
-filename is never touched by an incremental update. Verified: incremental scroll
-output matches a full redraw at every position, in every mode.
+### 4.2 Fast path แบบ inline สำหรับตัวอักษรธรรมดา
 
-### 5.2 Stale expand flag placed marks one column off
+ตัวอักษรฐานที่ไม่มีสไตล์ในโหมด planar (EGA/VGA) คือกรณีที่เจอบ่อยที่สุดแบบ
+ทิ้งห่าง ต้นฉบับยังคงส่งผ่าน pipeline เต็มรูปแบบ: copy glyph ลง cell buffer,
+copy ต่อไปยัง buffer ชั่วคราว, รันขั้นตอนใส่สไตล์, dispatch แล้วค่อย blit
 
-After an expanded (double-width) base glyph, an internal "previous cell was
-expanded" flag was not reset on the fast path, so a following combining mark
-could be composited one column to the left. Fixed by resetting the flag
-wherever a base is emitted.
+ตัวที่เขียนใหม่ตรวจจับกรณี "ตัวฐานธรรมดา ไม่มีสไตล์ใช้งาน อยู่ในโหมด planar
+ไม่ใช่สีกลับ (inverse)" แล้ว blit glyph สูง 19 แถวจากฟอนต์ลง VRAM ตรง ๆ ด้วย
+loop `movsb` แบบ unroll และตัวชี้ VRAM ที่วิ่งต่อเนื่อง (`add di,79` ระหว่าง
+สแกนไลน์) ไม่มีการ copy cell ไม่มีขั้นตอนใส่สไตล์ ไม่มี dispatch สระ/วรรณยุกต์
+และบรรทัดที่มีสไตล์ยังคงตกไปใช้ path เต็มรูปแบบเหมือนเดิม ไม่ได้ถูกแตะต้อง
 
-### 5.3 Incremental scroll left stale rows
+*ผล:* นี่คือสาเหตุหลักที่หน้า help วาดใหม่เร็วขึ้นถึง 4.7×
 
-The original's partial VRAM scroll redrew only a single newly-exposed row. On a
-multi-line scroll step (e.g. Page-Up/Down landing between clamp limits) the other
-newly-exposed rows kept stale content until a manual redraw. The rewrite redraws
-**all** exposed rows.
+### 4.3 ตารางที่อยู่สแกนไลน์เดียว ใช้ได้ทุกโหมด
 
-### 5.4 `cur_col` wrapped past 255 on very long lines
+ต้นฉบับคำนวณที่อยู่สแกนไลน์ต่างกันไปตามโหมด — คูณเลขสำหรับ planar, ใช้ LUT
+สำหรับ interleave — ซ้ำกันอยู่หลายจุดทั้งในโค้ดวาดจอ, เลื่อนจอ, ลบจอ และวาดแถบ
 
-On a single logical line wider than 255 columns, the column counter (a byte)
-overflowed and wrapped to 0, drawing stray marks at column 0. The rewrite
-saturates the counter. (Such lines never occur in real text — the reader caps a
-line at 255 bytes and the screen at 80 columns — but the wrap produced visible
-garbage.)
+ตัวที่เขียนใหม่สร้าง `vrow_tab[512]` ครั้งเดียวตอนเปิดโปรแกรม (เก็บ VRAM offset
+ของทุกสแกนไลน์ คิดรวมการสลับ bank ของ CGA/Hercules ไว้แล้ว) แล้วทุก routine
+ที่วาดจอก็ไป index ตารางนี้แทน ไม่มีการคูณเลขใน hot path อีก และใช้โค้ดชุด
+เดียวกันได้ทั้ง 4 โหมด ซึ่งช่วยลดขนาดไบนารีไปด้วย
 
-### 5.5 Last-column / ESC-handling consistency
+### 4.4 อ่าน/เขียนหน่วยความจำทีละ word
 
-Minor guards so a wide glyph at the last visible column never wraps to the next
-scanline, and so the `ESC` intro byte is stripped identically by the loader and
-by the renderer.
+การล้างจอ, แถบ status bar สีกลับ, การประกอบ cell (ตัวฐาน OR สระ/วรรณยุกต์) และ
+การ blit เลื่อนจอใน VRAM ตอนนี้ย้ายข้อมูลทีละ 2 ไบต์ (`stosw`/`movsw`) แทนที่
+จะเป็น 1 ไบต์ ลดจำนวนรอบ loop ลงครึ่งหนึ่งในจุดที่ย้ายข้อมูลเยอะที่สุด
 
-### 5.6 Embedded `00` bytes truncated the file *(reported after initial release)*
+### 4.5 ตาราง dispatch คีย์
 
-The original — and, unnoticed, the first pass of this rewrite — treated the
-literal byte value `00` (and `1A`) inside the file's content as end-of-text,
-checked directly against the byte value rather than its position. Real-world
-documents that use `00` as a filler/box-drawing glyph mid-line (a table row
-built from repeated `00` bytes, for example) were cut off far short of their
-true end, both in the line count and in what got drawn.
+เดิมตัวจัดการคีย์บอร์ดเช็คแบบเรียงลำดับ `cmp al,<key>` / `je <handler>`
+กลายเป็นตารางเดียว: normalize คีย์ที่กด, `scasb` หาในลิสต์คีย์ แล้ว
+`jmp [table+bx]` เล็กลงและใช้เวลาคงที่ไม่ว่าจะกดคีย์ไหน
 
-The fix separates two different questions that the value check had conflated:
-"where does the loaded text actually end" and "what does this particular byte
-mean". The loader now records a single `buf_end_seg:buf_end_off` position —
-the true end of what was actually read from disk — once, when the file (or the
-built-in help text) is loaded. `RDCH`, `peek`, and `build_lines` all check
-*position* against that marker to know when they've run out of text; no byte
-value is special-cased for that purpose any more. Separately, `00` was
-reclassified from "terminator" to "swallowed control" in the byte-class table,
-so it now behaves like any other invisible control code instead of ending
-anything. `1A` (`^Z`) keeps its original terminator classification — it is the
-conventional DOS end-of-text marker, and treating it as ordinary content
-regressed pixel-exact output on several fuzz-generated files during
-verification, for no benefit real files need.
+### 4.6 บีบอัดข้อมูล พร้อมตัวคลายตอนเปิดโปรแกรม
 
-Verified against a real user-submitted document containing ~195 embedded `00`
-bytes: the line count went from stopping at line 30 to reaching the file's
-true last line.
+`AXV.FON` (4,864 ไบต์) และ `HELP.TXT` (ใช้จริง 1,300 ไบต์) ถูกเก็บแบบบีบอัด
+run-length ไว้ในไบนารี (**6,164 → 3,658 ไบต์**) แล้วคลายลง BSS ตอนเปิดโปรแกรม
+ด้วยตัวถอดรหัสเล็ก ๆ (`00 <len> <byte>` = run, นอกนั้น = literal) เนื้อหา help
+ยังถูกตัดที่ตัวจบข้อความตัวแรกตอน pack ด้วย ตัดขยะที่เคยแนบมาแบบเต็ม ๆ ทิ้งไป
 
-*(While verifying this fix, an unrelated latent bug was also found and fixed:
-`redraw` loaded the row count with a byte-only `mov cl,[body]` before a `loop`
-instruction, which tests the full 16-bit `CX`. It happened to work only
-because whatever ran before `redraw` coincidentally left the high byte zero;
-a `build_lines` change added while fixing the `00` issue stopped leaving it
-zero, which turned every screen redraw into thousands of extra loop
-iterations — 47–120× more instructions per file open, and outright timeouts
-in CGA/Hercules modes. Fixed with an explicit `xor ch,ch`, matching the
-already-safe pattern used at the other call site of the same routine.)*
+### 4.7 ย้ายสถานะที่ต้อง zero ไปไว้ใน BSS
 
-### 5.7 `/t` selftest delay removed
+ตัวแปร/บัฟเฟอร์ที่ใช้ชั่วคราวหรือเปลี่ยนค่าได้ทั้งหมด (ตาราง, cell buffer,
+สถานะตัวอ่านไฟล์, ตารางบรรทัด) ตอนนี้เป็น `resb`/`resw` อยู่ใน section `.bss`
+แทนที่จะเป็นไบต์ที่ initialize ไว้ในไฟล์จริง ถูก zero ครั้งเดียวตอนเปิดโปรแกรม
+ตัดไบต์ศูนย์หลายกิโลไบต์ออกจากไฟล์บนดิสก์
 
-The selftest screen used to hold for a fixed ~15 seconds (a BIOS tick-count
-poll) before returning to DOS. It now waits for any keypress instead, so it
-can be dismissed immediately.
+### 4.8 ลบโค้ดที่ไม่ใช้ทิ้ง
 
-### 5.8 Tab (`09`) now expands to 8 spaces
-
-Previously a literal tab byte fell through to the plain-glyph path like any
-other unclassified byte, drawing whatever font glyph happens to sit at index
-9 (garbage) and counting as a single column. It is now a distinct byte class
-(`C_TAB`) that expands to 8 real space characters.
-
-Rendering one input byte as 8 output cells doesn't fit the "one call reads
-one byte" shape of `RDCH` (the per-character reader used throughout
-`draw_line`), so the macro now tracks how many synthetic spaces are still
-owed in a one-byte counter, `tab_run`: the first read of a `09` consumes it
-from the buffer once, sets `tab_run = 7`, and returns a plain space for this
-call; the next 7 calls return plain spaces without touching the buffer at
-all, decrementing `tab_run` each time; the 9th call resumes reading real
-bytes from the (already-correct) position. Every one of those 8 synthetic
-reads is indistinguishable from a real space to the rest of `draw_line` —
-same class, same font glyph, subject to the same active style — so a tab
-under an active "expanded" style widens exactly like 8 real spaces would.
-`build_lines` (which only counts columns, not pixels) doesn't need the
-multi-step expansion — it just adds 8 to the running column count in one
-step, saturating at the existing 255-column cap.
-
-Verified pixel-identical against 8 literal space characters in the same
-position, in every video mode.
+routine การประกอบวรรณยุกต์ที่ไม่มีทางถูกเรียกถึง กับตัวช่วย "snug shift" ของมัน,
+flag ความสูง cell ที่ไม่มีใครใช้พร้อมตัวตั้งค่าของมัน, การ copy buffer ต่อ cell
+ที่ซ้ำซ้อน และสถานะเก่าที่ตกค้างอื่น ๆ ถูกลบทิ้งทั้งหมด
 
 ---
 
-## 6. Memory footprint
+## 5. บั๊กที่แก้ (การแก้ไขพฤติกรรม)
 
-- **On disk:** 7,637 bytes (from 15,349).
-- **At runtime:** the BSS adds ~9.6 KB, zeroed at startup — glyph and class
-  tables, the scanline LUT, cell buffers, viewer state, and the line table.
-- **File buffers and line table** are unchanged in spirit: up to 8×64 KB blocks
-  loaded contiguously at CS+1000h, with the line table growing upward below the
-  stack. Table capacity is now sized dynamically to the space available
-  (≈11 k lines) rather than a fixed 12,288, so it is never smaller in practice
-  for files the original could display.
+รายการนี้คือบั๊กแฝงในต้นฉบับที่การเขียนใหม่แก้ให้ ทุกจุดผ่านการตรวจสอบด้วยระบบ
+ทดสอบเทียบพิกเซลตรงเป๊ะแล้ว
+
+### 5.1 Status bar เพี้ยนตอนเลื่อนจอ *(บั๊กที่มีการแจ้งเข้ามา)*
+
+**อาการ:** เลื่อนไฟล์จนช่วงบรรทัดที่แสดงมีจำนวนหลักเพิ่มขึ้น — เช่น `R:1-24` →
+`R:11-34` ที่บรรทัด 11 — ทำให้ส่วน **ชื่อไฟล์** ของ status bar เพี้ยน (เห็นเป็น
+`\cw\CWi6.DOC` ซ้อนกันบนจอ) และเส้นขีดใต้ตัวเลขก็ขาดไปด้วย
+
+**สาเหตุ:** ต้นฉบับวาด status bar ใหม่โดยเทียบสตริงที่สร้างขึ้นใหม่กับสำเนา
+"shadow" ที่เก็บไว้ทีละไบต์ แล้วจัดว่าความต่างแต่ละจุดอยู่ในหรือนอกช่วงตัวเลขที่
+เปลี่ยน พอ *จำนวนหลัก* ของตัวเลขเปลี่ยน ทุกไบต์หลังจากจุดนั้นก็เลื่อนตำแหน่งไป
+1 ที่ การเทียบจึงคลาดกัน และไปตีว่าไบต์ของชื่อไฟล์ "เปลี่ยน" แล้ววาดทับที่
+คอลัมน์ผิด
+
+**วิธีแก้:** ตัวที่เขียนใหม่ติดตามแค่ *ความยาว* ของช่องตัวเลข ถ้าความยาวไม่
+เปลี่ยน (เช่น `12-35` → `13-36`) จะวาดใหม่แค่คอลัมน์ตัวเลข ถ้าความยาวเปลี่ยน
+(เช่น `1-24` → `11-34`) จะวาดทั้งแถบใหม่หมดสะอาด ๆ ชื่อไฟล์จะไม่ถูกแตะต้องโดย
+การอัปเดตบางส่วนเลย ตรวจสอบแล้วว่าผลการวาดซ่อมบางส่วนตอนเลื่อนตรงกับการวาดใหม่
+ทั้งจอทุกตำแหน่ง ทุกโหมด
+
+### 5.2 Flag ตัวขยายค้าง ทำให้สระ/วรรณยุกต์เลื่อนคอลัมน์ผิด
+
+หลังจากวาดตัวอักษรฐานแบบขยาย (กว้างเป็น 2 เท่า) flag ภายในที่บอกว่า "cell
+ก่อนหน้าถูกขยาย" ไม่ถูกรีเซ็ตใน fast path ทำให้สระ/วรรณยุกต์ที่ตามมาอาจถูก
+ประกอบเลื่อนไปทางซ้าย 1 คอลัมน์ แก้โดยรีเซ็ต flag นี้ทุกจุดที่มีการวางตัวฐาน
+
+### 5.3 การเลื่อนจอบางส่วนทิ้งแถวเก่าค้างไว้
+
+การ blit เลื่อนจอบางส่วนของต้นฉบับวาดใหม่แค่แถวที่เพิ่งโผล่มา 1 แถวเท่านั้น
+พอเป็นการเลื่อนหลายบรรทัดในครั้งเดียว (เช่น Page-Up/Down ที่ตกอยู่ระหว่างขอบเขต
+การ clamp) แถวอื่นที่โผล่มาใหม่จะยังค้างเนื้อหาเก่าจนกว่าจะสั่งวาดใหม่เอง ตัวที่
+เขียนใหม่วาดแถวที่โผล่มาใหม่ **ทุกแถว**
+
+### 5.4 `cur_col` ล้นวนกลับ 0 บนบรรทัดที่ยาวเกิน 255
+
+บนบรรทัดตรรกะเดี่ยวที่กว้างเกิน 255 คอลัมน์ ตัวนับคอลัมน์ (ซึ่งเป็นไบต์เดียว)
+ล้นวนกลับไปที่ 0 ทำให้วาดรอยขยะที่คอลัมน์ 0 ตัวที่เขียนใหม่ทำให้ตัวนับหยุด
+ค้างที่ค่าสูงสุดแทนการล้นวน (บรรทัดแบบนี้ไม่เกิดขึ้นจริงในข้อความปกติ — ตัวอ่าน
+จำกัดบรรทัดไว้ที่ 255 ไบต์ และจอไว้ที่ 80 คอลัมน์อยู่แล้ว — แต่การล้นวนก็ยังทำ
+ให้เห็นขยะบนจอได้จริง)
+
+### 5.5 ความสม่ำเสมอของคอลัมน์สุดท้าย / การจัดการ ESC
+
+การ์ดป้องกันเล็กน้อยเพื่อให้ glyph กว้างที่คอลัมน์สุดท้ายที่มองเห็นไม่ล้นไปยัง
+สแกนไลน์ถัดไป และให้ไบต์นำ `ESC` ถูกตัดออกแบบเดียวกันทั้งฝั่งตัวโหลดไฟล์และฝั่ง
+ตัววาดจอ
+
+### 5.6 ไบต์ `00` แทรกกลางไฟล์ทำให้แสดงผลไม่จบ *(แจ้งเข้ามาหลังปล่อยรุ่นแรก)*
+
+ต้นฉบับ — และการเขียนใหม่รอบแรกที่ยังไม่รู้ตัว — ถือว่าไบต์ค่า `00` (และ `1A`)
+ที่อยู่ในเนื้อหาไฟล์คือจุดจบข้อความ โดยเช็คจาก **ค่า** ของไบต์ตรง ๆ แทนที่จะเช็ค
+ตำแหน่ง เอกสารจริงที่ใช้ `00` เป็น glyph เติมเต็ม/ตีเส้นตารางกลางบรรทัด (เช่น
+แถวตารางที่สร้างจากไบต์ `00` ซ้ำ ๆ) จึงถูกตัดจบไปก่อนถึงจุดจบจริงมาก ทั้งใน
+จำนวนบรรทัดที่นับได้และสิ่งที่วาดออกมา
+
+การแก้ไขนี้แยกคำถาม 2 อย่างที่การเช็คด้วยค่าไบต์เอาไปปนกัน: "เนื้อหาที่โหลดมา
+จริง ๆ จบตรงไหน" กับ "ไบต์ตัวนี้แปลว่าอะไร" ตัวโหลดไฟล์ตอนนี้บันทึกตำแหน่ง
+`buf_end_seg:buf_end_off` ไว้ตำแหน่งเดียว — คือจุดจบจริงของสิ่งที่อ่านมาจาก
+ดิสก์ — ครั้งเดียวตอนโหลดไฟล์ (หรือเนื้อหา help ในตัว) `RDCH`, `peek` และ
+`build_lines` ทั้งหมดเช็ค *ตำแหน่ง* เทียบกับจุดนี้เพื่อรู้ว่าอ่านหมดแล้ว
+ไม่มีการเช็คค่าไบต์เป็นพิเศษเพื่อจุดประสงค์นี้อีกต่อไป และแยกกันไป `00` ถูกจัด
+คลาสใหม่จาก "ตัวจบข้อความ" เป็น "ตัวควบคุมที่ถูกกลืน" ในตาราง byte-class ทำให้
+ตอนนี้มันมีพฤติกรรมเหมือนตัวควบคุมที่มองไม่เห็นตัวอื่น ๆ แทนที่จะไปจบอะไรทั้งนั้น
+ส่วน `1A` (`^Z`) ยังคงเป็นตัวจบข้อความตามเดิม — เพราะเป็นเครื่องหมายจบไฟล์แบบ
+ธรรมเนียมของ DOS และการเปลี่ยนให้มันเป็นแค่เนื้อหาธรรมดาทำให้ผลลัพธ์ไม่ตรง
+พิกเซลกับหลายไฟล์ที่สร้างจาก fuzz test ตอนตรวจสอบ โดยไม่ได้ประโยชน์อะไรกับ
+ไฟล์จริงเลย
+
+ตรวจสอบกับเอกสารจริงที่ผู้ใช้ส่งมา ซึ่งมีไบต์ `00` แทรกอยู่ ~195 ตัว: จำนวน
+บรรทัดที่แสดงได้เปลี่ยนจากหยุดที่บรรทัด 30 เป็นไปถึงบรรทัดสุดท้ายจริงของไฟล์
+
+*(ระหว่างตรวจสอบการแก้จุดนี้ เจอบั๊กแฝงอีกจุดที่ไม่เกี่ยวข้องกันโดยตรง และแก้ไป
+ด้วย: `redraw` โหลดจำนวนแถวด้วย `mov cl,[body]` (ไบต์เดียว) ก่อนเรียกคำสั่ง
+`loop` ซึ่งเช็คค่า `CX` เต็ม 16 บิต เดิมมันใช้งานได้เพราะโค้ดที่รันก่อนหน้า
+`redraw` บังเอิญเหลือไบต์สูงเป็นศูนย์อยู่เสมอ พอมีการแก้ `build_lines` สำหรับ
+ปัญหา `00` เข้าไป ก็ทำให้ไบต์สูงไม่เป็นศูนย์อีกต่อไป ผลคือทุกครั้งที่วาดจอใหม่
+จะวนลูปเกินหลายพันรอบโดยไม่จำเป็น — คำสั่งที่ใช้เพิ่มขึ้น 47–120 เท่าต่อการเปิด
+ไฟล์หนึ่งครั้ง และค้างจอไปเลยในโหมด CGA/Hercules แก้ด้วยการเพิ่ม `xor ch,ch`
+ให้ชัดเจน ตรงตามแพตเทิร์นที่จุดเรียกใช้ routine เดียวกันอีกจุดหนึ่งทำไว้ถูก
+อยู่แล้ว)*
+
+### 5.7 ตัด delay ของ selftest (`/t`) ออก
+
+เดิมหน้าจอ selftest จะค้างรออยู่ ~15 วินาที (วนเช็คค่า tick ของ BIOS) ก่อนกลับ
+สู่ DOS ตอนนี้เปลี่ยนเป็นรอกดคีย์ใดก็ได้แทน จึงสามารถออกได้ทันทีที่ต้องการ
+
+### 5.8 Tab (`09`) ขยายเป็น 8 ช่องว่างแล้ว
+
+เดิมไบต์ tab จริง ๆ จะตกไปอยู่ใน path ของตัวอักษรธรรมดาเหมือนไบต์ที่ไม่ได้จัด
+คลาสใดๆ ทำให้วาด glyph ขยะจากตำแหน่งที่ 9 ของฟอนต์ออกมา และนับเป็นแค่ 1
+คอลัมน์ ตอนนี้ tab เป็นคลาสไบต์แยกต่างหาก (`C_TAB`) ที่ขยายเป็นตัวอักษรช่องว่าง
+จริง 8 ตัว
+
+การวาดไบต์ตัวเดียวให้ออกมาเป็น 8 cell บนจอไม่เข้ากับรูปแบบ "เรียกหนึ่งครั้งอ่าน
+หนึ่งไบต์" ของ `RDCH` (ตัวอ่านทีละตัวอักษรที่ใช้ทั่วทั้ง `draw_line`) จึงเพิ่ม
+ตัวนับ 1 ไบต์ชื่อ `tab_run` ไว้ในแมโครนี้เพื่อติดตามว่ายังค้างจ่ายช่องว่างอีกกี่
+ตัว: การอ่าน `09` ครั้งแรกจะดึงไบต์จริงจากบัฟเฟอร์ครั้งเดียว ตั้ง `tab_run = 7`
+แล้วคืนค่าเป็นช่องว่างสำหรับการเรียกครั้งนี้; อีก 7 ครั้งถัดไปจะคืนค่าช่องว่าง
+โดยไม่แตะบัฟเฟอร์เลย ลด `tab_run` ลงทีละ 1 ทุกครั้ง; พอถึงการเรียกครั้งที่ 9 จึง
+กลับไปอ่านไบต์จริงต่อจากตำแหน่งที่ถูกต้องอยู่แล้ว ทั้ง 8 ครั้งของการอ่านสังเคราะห์
+นี้จะแยกไม่ออกจากช่องว่างจริงในสายตาของส่วนอื่นใน `draw_line` เลย — คลาสเดียวกัน,
+glyph ฟอนต์เดียวกัน, อยู่ภายใต้สไตล์ที่กำลังใช้งานเหมือนกัน — ดังนั้นถ้ามีสไตล์
+"ขยาย" ทำงานอยู่ tab ก็จะกว้างขึ้นเท่ากับช่องว่างจริง 8 ตัวเป๊ะ ส่วน
+`build_lines` (ซึ่งนับแค่คอลัมน์ ไม่ได้วาดพิกเซล) ไม่จำเป็นต้องขยายทีละขั้นแบบ
+นั้น — แค่บวกคอลัมน์ทีละ 8 ในขั้นตอนเดียว โดยยังมี saturate ที่เพดาน 255
+คอลัมน์เหมือนเดิม
+
+ตรวจสอบแล้วว่าให้พิกเซลตรงกันเป๊ะกับการพิมพ์ช่องว่าง 8 ตัวจริง ๆ ในตำแหน่งเดียว
+กัน ทุกโหมดจอ
 
 ---
 
-## 7. Build
+## 6. การใช้หน่วยความจำ
 
-Unchanged workflow, one added step. `build_read.py` now (1) run-length packs
-`AXV.FON` + `HELP.TXT` into `packed.bin`, (2) assembles `read.asm` with NASM,
-and (3) strips the 0x100h pad NASM emits under `-f bin`.
+- **บนดิสก์:** 7,637 ไบต์ (จากเดิม 15,349)
+- **ตอนรันจริง:** BSS เพิ่มขึ้นอีก ~9.6 KB ถูก zero ตอนเปิดโปรแกรม — ตารางฟอนต์
+  และคลาสไบต์, ตาราง scanline LUT, cell buffer, สถานะของตัวอ่าน และตารางบรรทัด
+- **บัฟเฟอร์ไฟล์และตารางบรรทัด** ยังคงหลักการเดิม: โหลดได้สูงสุด 8×64 KB block
+  ต่อเนื่องกันที่ CS+1000h เป็นต้นไป โดยตารางบรรทัดงอกขึ้นด้านบนใต้ stack ความจุ
+  ตารางตอนนี้คำนวณแบบไดนามิกตามพื้นที่ว่างจริง (≈11,000 บรรทัด) แทนที่จะ fix
+  ไว้ที่ 12,288 จึงไม่มีทางเล็กกว่าเดิมในทางปฏิบัติสำหรับไฟล์ที่ต้นฉบับเคย
+  แสดงผลได้
+
+---
+
+## 7. การ Build
+
+ขั้นตอนเหมือนเดิม เพิ่มมาแค่ 1 ขั้น `build_read.py` ตอนนี้ทำ (1) บีบอัด
+`AXV.FON` + `HELP.TXT` แบบ run-length ลง `packed.bin`, (2) เรียก NASM
+ประกอบ `read.asm`, (3) ตัด pad ขนาด 0x100h ที่ NASM แปะไว้เมื่อใช้ `-f bin`
+ทิ้ง แล้วเขียนไฟล์สุดท้ายลงโฟลเดอร์ `output/` ที่อยู่ใต้ตำแหน่งเดียวกับ
+`read.asm` (สร้างโฟลเดอร์ให้อัตโนมัติถ้ายังไม่มี)
 
 ```
-python build_read.py     # -> read.com
+python build_read.py     # -> output/read.com
 ```
 
-Requires NASM 2.x or 3.x. `packed.bin`/`packed.inc` are regenerated each build
-and need not be kept in source control.
+ต้องมี NASM 2.x หรือ 3.x `packed.bin`/`packed.inc` จะถูกสร้างใหม่ทุกครั้งที่
+build ไม่จำเป็นต้องเก็บไว้ใน source control
 
 ---
 
-## 8. Summary
+## 8. สรุป
 
-The reader is now half the size and roughly two to nearly five times fewer
-cycles on the paths that run while a user reads and scrolls, with no visible
-change on real Thai text — and with the scrolling status-bar corruption, plus
-four other latent rendering defects, corrected along the way. Every claim here
-is backed by pixel-exact comparison and an instruction-level cycle count over an
-8086 emulator, across all four video modes and ~600 generated test files.
+ตอนนี้ตัวอ่านเล็กลงเหลือครึ่งเดียว และใช้ cycle น้อยลงราวสองถึงเกือบห้าเท่าใน
+เส้นทางที่ทำงานตลอดตอนผู้ใช้อ่านและเลื่อนดูเนื้อหา โดยไม่มีอะไรเปลี่ยนที่มองเห็น
+ได้บนข้อความไทยจริง — พร้อมทั้งแก้บั๊ก status bar เพี้ยนตอนเลื่อนที่มีการแจ้งเข้า
+มา และบั๊กแฝงในการวาดจออีก 4 จุด ไปพร้อมกันด้วย ทุกตัวเลขในรายงานนี้ยืนยันด้วย
+การเทียบพิกเซลตรงเป๊ะและการนับ cycle ระดับคำสั่งผ่าน emulator แบบ 8086 ครบทั้ง
+4 โหมดจอ และไฟล์ทดสอบที่สร้างขึ้นอีกราว 600 ไฟล์
