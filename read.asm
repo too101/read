@@ -283,9 +283,8 @@ enter_help:
         mov     [help_nlines], ax
 eh_have:
         mov     [nlines], ax
-        call    calc_top
-        mov     word [top], 0
-        mov     byte [help_mode], 1
+        call    calc_limits          ; also recomputes maxh from help's own
+        mov     byte [help_mode], 1  ; maxlen -- must not inherit the file's
 eh_ret: ret
 
 exit_help:
@@ -329,13 +328,19 @@ calc_top:
 ct1:    mov     [topmax], ax
         ret
 
-; calc_limits: topmax, top/hshift = 0, maxh = max(maxlen-80, 0)
+; calc_limits: topmax, top/hshift = 0, maxh = max(maxlen-text_cols, 0)
+; text_cols is mode-specific (80 for CGA/EGA/VGA, 90 for Hercules -- see
+; vparm) so the scroll threshold matches what draw_line actually fits on
+; screen in the active mode, not a fixed 80 that would falsely enable
+; scroll on HGC for lines 81-90 columns wide (which fit HGC fine).
 calc_limits:
         call    calc_top
         mov     word [top], 0
         mov     word [hshift], 0
         mov     ax, [maxlen]
-        sub     ax, 80
+        mov     bl, [text_cols]
+        xor     bh, bh
+        sub     ax, bx
         jnc     cl2
         xor     ax, ax
 cl2:    mov     [maxh], ax
@@ -1226,7 +1231,9 @@ lf_rd:  mov     cx, 8000h
 ;---------------- line table build -------------------------------------
 build_lines:
         mov     word [nlines], 1
-        mov     es, [blk0]
+        mov     word [maxlen], 0     ; a fresh table starts its own max fresh
+        mov     es, [blk0]           ; -- must not inherit whatever table
+                                      ; (file or help) was scanned last
         mov     si, [build_start]
         mov     di, [lin_base]
         mov     [di], es
@@ -1257,11 +1264,14 @@ bl_wrap:
         jmp     bl_c
 bl_sp:  test    ah, C_TERM
         jnz     bl_term
-        test    ah, C_STYLE          ; style codes count (as in TREAD),
-        jnz     bl_cnt               ; marks/controls don't
         test    ah, C_TAB            ; tab = 8 columns at once (RDCH expands
         jnz     bl_tab               ; it to 8 draws; count needs to match)
-        jmp     bl_l
+        jmp     bl_l                 ; C_STYLE/C_SWAL/C_COMB: zero-width, same
+                                      ; as draw_line (style_toggle/swallowed/
+                                      ; combining marks never advance cur_col) --
+                                      ; a line of exactly N visible columns
+                                      ; must not report maxlen > N just because
+                                      ; it also carries style toggle bytes
 bl_tab: mov     al, dl
         add     al, 8
         jnc     bl_tabok
