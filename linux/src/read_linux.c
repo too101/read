@@ -228,6 +228,30 @@ static unsigned int *g_px = NULL; /* g_win_w x g_win_h, top-down 0x00RRGGBB */
 static int g_use_shm = 0;
 static XShmSegmentInfo g_shminfo;
 
+/* Segments retired by fb_destroy_image() but not actually detached yet --
+ * see fb_destroy_image()'s comment for why. Sized generously for how often
+ * a person resizes in one sitting; reap_retired_shm() trims it. */
+#define SHM_RETIRE_MAX 8
+static XShmSegmentInfo g_shm_retired[SHM_RETIRE_MAX];
+static int g_shm_retired_n = 0;
+
+/* Actually detach+shmdt every segment on the retired list. Called once at
+ * exit (nothing left to race with by then) and opportunistically whenever
+ * the list is full (oldest-first, so each one has had the most time to be
+ * safe -- see fb_destroy_image()). */
+static void reap_retired_shm(Display *dpy, int keep_newest) {
+    int drop = g_shm_retired_n - keep_newest;
+    for (int i = 0; i < drop; i++) {
+        XShmDetach(dpy, &g_shm_retired[i]);
+        shmdt(g_shm_retired[i].shmaddr);
+    }
+    if (drop > 0) {
+        memmove(&g_shm_retired[0], &g_shm_retired[drop],
+                (size_t)(g_shm_retired_n - drop) * sizeof(g_shm_retired[0]));
+        g_shm_retired_n -= drop;
+    }
+}
+
 /* Creates a fresh framebuffer + its backing XImage, sized to the CURRENT
  * g_win_w/g_win_h. Prefers the MIT-SHM extension: with it, the shared-
  * memory segment *is* g_px, so a later XShmPutImage has the X server read
@@ -285,10 +309,33 @@ static XImage *fb_create(Display *dpy, Visual *visual, int depth) {
 
 static void fb_destroy_image(Display *dpy, XImage *img) {
     if (g_use_shm) {
-        XShmDetach(dpy, &g_shminfo);
+        /* Don't XShmDetach/shmdt this segment right now -- XSync() after
+         * XShmPutImage only guarantees the X server (Xwayland, here) has
+         * processed the request; under Xwayland that plausibly means
+         * handing the shared memory straight to the Wayland compositor
+         * (Weston, in WSLg's Xwayland -> Weston -> RDP-to-Windows-host
+         * pipeline) as a wl_buffer for it to read on its own schedule, not
+         * that the compositor has actually finished reading it yet -- X11's
+         * MIT-SHM ShmCompletion event (which we don't track either) only
+         * covers the X server's own side of that handoff, not what a
+         * Wayland compositor downstream of it does with the buffer
+         * afterward. Detaching and reusing/freeing this memory immediately
+         * on a resize (which is exactly when this runs) risks the
+         * compositor still reading it right as we do -- one plausible
+         * mechanism for "maximize -> blank until something else redraws":
+         * this specific memory going away out from under an in-flight read,
+         * not a generic WSLg quirk unrelated to this program (this matches
+         * a real report: xclock/xeyes, which don't blit through a resized
+         * MIT-SHM buffer like this, don't reproduce it). So: park the
+         * segment on a short retirement list and only actually detach it
+         * once several more resizes have happened, by which point the
+         * compositor is certain to be done with it -- worst case if this
+         * theory is wrong is a few extra shared-memory segments alive
+         * briefly, not a race. */
+        if (g_shm_retired_n == SHM_RETIRE_MAX) reap_retired_shm(dpy, SHM_RETIRE_MAX - 1);
+        g_shm_retired[g_shm_retired_n++] = g_shminfo;
         XDestroyImage(img);   /* frees the XImage struct only -- the pixel
-                                  data is the shm segment, detached above */
-        shmdt(g_shminfo.shmaddr);
+                                  data is the shm segment, retired above */
         g_use_shm = 0;
     } else {
         XDestroyImage(img);   /* frees g_px too -- it owns that pointer */
@@ -900,6 +947,7 @@ int main(int argc, char **argv) {
     }
 
     fb_destroy_image(dpy, ximg);
+    reap_retired_shm(dpy, 0); /* nothing left to race with -- clean up everything */
     XFreeGC(dpy, gc);
     XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);
