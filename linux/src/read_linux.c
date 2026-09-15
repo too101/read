@@ -490,6 +490,46 @@ static void clamp_hshift(int wanted) {
     g_hshift = wanted;
 }
 
+/* Applies one keypress's effect on state (scroll position, help mode, KU
+ * mode, quit). Split out from main()'s event loop so a run of queued
+ * KeyPress events (key-repeat from holding an arrow key, or just fast
+ * typing) can all be applied before the one expensive render_all() +
+ * XPutImage() at the end, instead of doing a full redraw per keystroke --
+ * see the ConfigureNotify coalescing comment in main() for why that matters
+ * over a forwarded display pipe such as WSLg. Returns 1 if this key
+ * changed something that needs a redraw, 0 otherwise. Sets *running to 0
+ * on quit. */
+static int apply_key(KeySym ks, int *running) {
+    int redraw = 1;
+    switch (ks) {
+    case XK_Up:        clamp_top(g_top - 1); break;
+    case XK_Down:      clamp_top(g_top + 1); break;
+    case XK_Prior:     clamp_top(g_top - g_body); break;
+    case XK_Next:      clamp_top(g_top + g_body); break;
+    case XK_space:     clamp_top(g_top + g_body); break;
+    case XK_BackSpace: clamp_top(g_top - g_body); break;
+    case XK_Home:      clamp_top(0); break;
+    case XK_End:       clamp_top(g_topmax); break;
+    case XK_Left:      clamp_hshift(g_hshift - 8); break;
+    case XK_Right:     clamp_hshift(g_hshift + 8); break;
+    case XK_F1:        if (g_help_mode) exit_help(); else enter_help(); break;
+    case XK_c: case XK_C: g_ku_mode ^= 1; break;
+    case XK_Escape:    *running = 0; redraw = 0; break;
+    case XK_q: case XK_Q: *running = 0; redraw = 0; break;
+    default:
+        /* like read.asm's help view: any other key dismisses help --
+           back to the file if one is loaded, or quits in demo mode */
+        if (g_help_mode) {
+            if (g_filebuf) exit_help();
+            else { *running = 0; redraw = 0; }
+        } else {
+            redraw = 0;
+        }
+        break;
+    }
+    return redraw;
+}
+
 int main(int argc, char **argv) {
     fb_create();
     if (!g_px) { fprintf(stderr, "out of memory\n"); return 1; }
@@ -540,6 +580,22 @@ int main(int argc, char **argv) {
             break;
         case ConfigureNotify: {
             int new_w = ev.xconfigure.width, new_h = ev.xconfigure.height;
+            /* A live resize drag floods the queue with ConfigureNotify --
+             * one per intermediate size the window manager reports, often
+             * many per second. Recreating the framebuffer and doing a full
+             * render_all() + full-window XPutImage() for every one of them
+             * is wasted work, and over a forwarded display pipe like WSLg
+             * (Xwayland -> Weston -> RDP to the Windows host) each of those
+             * full-window blits carries real transport overhead, so it
+             * shows up as visible lag/stutter while dragging. Drain the
+             * queue first and keep only the *last* pending size -- the
+             * expensive rebuild below then runs once per drag "settle",
+             * not once per intermediate pixel. */
+            XEvent next;
+            while (XCheckTypedWindowEvent(dpy, win, ConfigureNotify, &next)) {
+                new_w = next.xconfigure.width;
+                new_h = next.xconfigure.height;
+            }
             /* ConfigureNotify fires for moves/stacking too, not just resize
              * -- skip the (common) no-op case, and guard against a bogus
              * 0-sized event rather than malloc(0) */
@@ -566,32 +622,19 @@ int main(int argc, char **argv) {
             break;
         case KeyPress: {
             KeySym ks = XLookupKeysym(&ev.xkey, 0);
-            int redraw = 1;
-            switch (ks) {
-            case XK_Up:        clamp_top(g_top - 1); break;
-            case XK_Down:      clamp_top(g_top + 1); break;
-            case XK_Prior:     clamp_top(g_top - g_body); break;
-            case XK_Next:      clamp_top(g_top + g_body); break;
-            case XK_space:     clamp_top(g_top + g_body); break;
-            case XK_BackSpace: clamp_top(g_top - g_body); break;
-            case XK_Home:      clamp_top(0); break;
-            case XK_End:       clamp_top(g_topmax); break;
-            case XK_Left:      clamp_hshift(g_hshift - 8); break;
-            case XK_Right:     clamp_hshift(g_hshift + 8); break;
-            case XK_F1:        if (g_help_mode) exit_help(); else enter_help(); break;
-            case XK_c: case XK_C: g_ku_mode ^= 1; break;
-            case XK_Escape:    running = 0; redraw = 0; break;
-            case XK_q: case XK_Q: running = 0; redraw = 0; break;
-            default:
-                /* like read.asm's help view: any other key dismisses help --
-                   back to the file if one is loaded, or quits in demo mode */
-                if (g_help_mode) {
-                    if (g_filebuf) exit_help();
-                    else { running = 0; redraw = 0; }
-                } else {
-                    redraw = 0;
-                }
-                break;
+            int redraw = apply_key(ks, &running);
+            /* Key-repeat from holding an arrow/PgDn/etc down (or just fast
+             * key-mashing) can queue up several KeyPress events before we
+             * get back around to XNextEvent. Apply all of them to the
+             * state now and redraw once at the end, rather than once per
+             * queued key -- same fix as the ConfigureNotify coalescing
+             * above, for the same reason (each full-window XPutImage has
+             * real cost over a forwarded display pipe like WSLg). */
+            while (running) {
+                XEvent next;
+                if (!XCheckTypedWindowEvent(dpy, win, KeyPress, &next)) break;
+                KeySym ks2 = XLookupKeysym(&next.xkey, 0);
+                if (apply_key(ks2, &running)) redraw = 1;
             }
             if (redraw && running) {
                 render_all();
