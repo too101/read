@@ -405,16 +405,16 @@ build_lines:
     add eax, [ebp-12]
     movzx eax, byte [eax]
     mov [ebp-16], eax          ; raw
-    ; classify the RAW byte, not translate()'s KU-translated one -- matches
-    ; read.asm's bl_c, which indexes its class table with AL straight from
-    ; the file with no KU translation at all (that only happens later, in
-    ; the draw-time RDCH/trc path). On a KU file this can make maxlen come
-    ; out larger than a "translate first" count would (a raw KU combining
-    ; mark usually isn't in TIS-620's D1h-EEh range, so it counts as a full
-    ; column instead of 0) -- confirmed against real DOS: that's the actual
-    ; original scroll limit, not a bug, so this must match it rather than
-    ; compute a "nicer" one of its own.
-    CALL1 classify, dword [ebp-16]
+    ; classify the KU-translated byte (translate() then classify()), not the
+    ; raw one -- so a KU combining-mark byte correctly counts as 0 columns,
+    ; same as it will draw. read.asm's own build_lines (bl_c) used to
+    ; classify the raw byte instead (translating only at draw time, in
+    ; RDCH), which inflated a KU file's line-table maxlen past what the
+    ; file actually needed on screen; read.asm has since been fixed to
+    ; translate before classifying here too, so all three ports now agree
+    ; with each other and with what's really on screen.
+    CALL1 translate, dword [ebp-16]
+    CALL1 classify, eax
     test eax, C_TERM
     jz .bl_not_term
     ; linetab_push(t, buf+line_start, i-line_start)
@@ -1654,6 +1654,15 @@ WndProc:
     mov eax, [g_ku_mode]
     xor eax, 1
     mov [g_ku_mode], eax
+    ; maxlen/maxh are KU-aware now (build_lines classifies the translated
+    ; byte), so a live toggle can change them -- rebuild and re-clamp, same
+    ; as a fresh load. Line offsets/nlines can't change (CR/LF are never
+    ; translated), only maxlen can.
+    cmp dword [g_help_mode], 0
+    jne .k11_done
+    CALL3 build_lines, g_tab, dword [g_filebuf], dword [g_filelen]
+    CALL1 recompute_bounds, g_tab
+.k11_done:
     jmp .k_done
 .k12:
     cmp dword [ebp+16], 0x1B          ; VK_ESCAPE

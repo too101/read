@@ -433,6 +433,13 @@ k_hs:   mov     [hshift], ax
 k_ku:   mov     cl, [ku_mode]        ; toggle KU decoding
         xor     cl, 1
         call    set_ku
+        call    build_lines          ; maxlen is KU-aware now (bl_c uses trc,
+        call    calc_maxh            ; just rebuilt above), so a toggle can
+        mov     ax, [hshift]         ; change it -- clamp hshift in case the
+        cmp     ax, [maxh]           ; toggle just shrank maxh below wherever
+        jbe     k_hs3                ; we were scrolled to (same clamp as
+        mov     ax, [maxh]           ; k_right below)
+k_hs3:  mov     [hshift], ax
         jmp     view_loop
 
 v_quit: call    gfx_off
@@ -1257,10 +1264,17 @@ bl_l:   mov     cx, es               ; true end of loaded text? (00/1A inside
 bl_rd:  mov     al, [es:si]
         inc     si
         jz      bl_wrap
-bl_c:   mov     bl, al
-        mov     ah, [cls+bx]         ; raw byte class
-        test    ah, ah
-        jnz     bl_sp
+bl_c:   xor     ah, ah               ; classify via trc (KU-aware, same table
+        mov     bx, ax               ; RDCH uses to draw), not the raw cls
+        shl     bx, 1                ; table -- so a combining mark inside a
+        mov     ax, [trc+bx]         ; KU-encoded run counts as zero columns
+        test    ah, ah               ; here exactly as it draws with zero
+        jnz     bl_sp                ; width, and maxlen/maxh reflect what
+                                      ; will actually appear on screen (AL is
+                                      ; now the translated char, but CR/LF/^Z
+                                      ; are <80h so trc never changes them --
+                                      ; bl_term's al compares below still see
+                                      ; the same byte values)
 bl_cnt: inc     dl                   ; column
         jnz     bl_l
         dec     dl                   ; line size cap = 255

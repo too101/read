@@ -3,10 +3,10 @@ dos/output/
 dos/packed.bin
 dos/packed.inc
 
-windows/read.exe
+windows/output/
 windows/src/data.inc
 
-linux/read
+linux/output/
 linux/src/data.h
 
 # Object files / misc

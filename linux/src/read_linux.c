@@ -33,6 +33,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <time.h>
+#include <sys/select.h>
 #include "data.h"
 
 /* ---------------- layout constants --------------------------------------- */
@@ -119,18 +121,15 @@ static void linetab_push(LineTab *t, const unsigned char *ptr, int len) {
  * style-toggle bytes). Caps a single line's counted width at 255, same as
  * the DOS build (a purely cosmetic cap -- doesn't affect what's stored).
  *
- * Classifies the RAW byte, not translate()'s KU-translated one, even in
- * KU mode -- this matches read.asm's bl_c, which indexes its class table
- * ([cls+bx]) with AL straight from the file with no KU translation at all
- * (translation only happens later, in the "read next byte for drawing"
- * path/RDCH's trc table). So on a KU-encoded file, maxlen here can come
- * out larger than a "translate first" count would give, since a raw KU
- * combining-mark byte usually doesn't fall in TIS-620's D1h-EEh combining
- * range and so gets counted as a full base column instead of 0 -- that's
- * a real quirk of the original program (confirmed: DOS reaches a higher
- * max hshift than a "corrected" translate-first count would allow), not
- * a bug to fix, and this port must reproduce it to match DOS's actual
- * scroll limit rather than a mathematically "nicer" one of its own. */
+ * Classifies the KU-translated byte (translate() then classify()), not the
+ * raw one -- so a KU combining-mark byte correctly counts as 0 columns,
+ * same as it will draw. read.asm's own build_lines (bl_c) used to classify
+ * the raw byte instead (translating only at draw time, in RDCH), which
+ * meant a KU file's line-table maxlen -- and so the horizontal scroll
+ * limit -- came out larger than what the file actually needed on screen;
+ * read.asm has since been fixed to translate before classifying here too
+ * (see its bl_c and the trc table set_ku builds), so all three ports now
+ * agree with each other and with what's really on screen. */
 static void build_lines(LineTab *t, const unsigned char *buf, int len) {
     linetab_free(t);
     int line_start = 0;
@@ -138,7 +137,7 @@ static void build_lines(LineTab *t, const unsigned char *buf, int len) {
     int i = 0;
     while (i < len) {
         unsigned char raw = buf[i];
-        unsigned char cls = classify(raw);
+        unsigned char cls = classify(translate(raw));
         if (cls & C_TERM) {
             linetab_push(t, buf + line_start, i - line_start);
             if (col > t->maxlen) t->maxlen = col;
@@ -612,7 +611,17 @@ static int apply_key(KeySym ks, int *running) {
     case XK_Left:      clamp_hshift(g_hshift - 8); break;
     case XK_Right:     clamp_hshift(g_hshift + 8); break;
     case XK_F1:        if (g_help_mode) exit_help(); else enter_help(); break;
-    case XK_c: case XK_C: g_ku_mode ^= 1; break;
+    case XK_c: case XK_C:
+        g_ku_mode ^= 1;
+        /* maxlen/maxh are KU-aware now (build_lines classifies the
+           translated byte), so a live toggle can change them -- rebuild
+           and re-clamp, same as a fresh load. Line offsets/nlines can't
+           change (CR/LF are never translated), only maxlen can. */
+        if (!g_help_mode) {
+            build_lines(&g_tab, g_filebuf, g_filelen);
+            recompute_bounds(&g_tab);
+        }
+        break;
     case XK_Escape:    *running = 0; redraw = 0; break;
     case XK_q: case XK_Q: *running = 0; redraw = 0; break;
     default:
@@ -740,7 +749,53 @@ int main(int argc, char **argv) {
 
     int running = 1;
     XEvent ev;
+    /* Follow-up repaint timer, armed after a resize/maximize (see the
+     * ConfigureNotify case below). Reported symptom on WSLg: after clicking
+     * Maximize the window goes solid black and stays that way until some
+     * unrelated later event (moving the mouse) happens to trigger a
+     * repaint -- even though we already sent the correct pixels via
+     * put_image() right after handling the resize, same as any other
+     * resize. That points at the compositor side (Weston, in WSLg's
+     * Xwayland -> Weston -> RDP-to-Windows-host pipeline) occasionally
+     * losing or mis-timing the damage from that specific blit during the
+     * maximize transition, not at anything wrong with what we drew or
+     * sent -- VisibilityNotify (below) was added as one safety net for
+     * this and reportedly didn't fix it either. A plain mouse move isn't
+     * an event this program reacts to at all, so "moving the mouse fixes
+     * it" isn't this program picking up some event we'd missed -- it's
+     * the Windows-side compositor's own damage/redraw logic getting
+     * kicked by something unrelated to X11. We can't make the compositor
+     * behave from here, but we can hedge against losing that one blit: a
+     * harmless extra full-window repaint a moment after every resize,
+     * timed independently of X11 events (a plain wall-clock deadline, via
+     * select() on the X connection's file descriptor) so it fires even if
+     * no further X event ever arrives to drive the loop around again. */
+    int repaint_pending = 0;
+    struct timespec repaint_due;
     while (running) {
+        if (repaint_pending && !XPending(dpy)) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long wait_ms = (repaint_due.tv_sec - now.tv_sec) * 1000
+                         + (repaint_due.tv_nsec - now.tv_nsec) / 1000000;
+            if (wait_ms < 0) wait_ms = 0;
+            fd_set fds;
+            FD_ZERO(&fds);
+            int xfd = ConnectionNumber(dpy);
+            FD_SET(xfd, &fds);
+            struct timeval tv = { wait_ms / 1000, (wait_ms % 1000) * 1000 };
+            int r = select(xfd + 1, &fds, NULL, NULL, &tv);
+            if (r == 0) {
+                /* deadline hit with no X event in between -- send the
+                   follow-up repaint and go back to waiting normally */
+                put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
+                repaint_pending = 0;
+                continue;
+            }
+            /* r > 0: an event arrived (or r < 0: interrupted) -- fall
+               through to XNextEvent below; repaint_pending stays armed
+               and will still fire later if nothing clears it sooner */
+        }
         XNextEvent(dpy, &ev);
         switch (ev.type) {
         case Expose:
@@ -794,6 +849,14 @@ int main(int argc, char **argv) {
             recompute_bounds(g_cur);  /* NOT calc_limits -- keep scroll pos */
             render_all();
             put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
+            /* arm the follow-up repaint (see its declaration above) */
+            repaint_pending = 1;
+            clock_gettime(CLOCK_MONOTONIC, &repaint_due);
+            repaint_due.tv_nsec += 200000000L; /* +200ms */
+            if (repaint_due.tv_nsec >= 1000000000L) {
+                repaint_due.tv_sec += 1;
+                repaint_due.tv_nsec -= 1000000000L;
+            }
             break;
         }
         case ClientMessage:

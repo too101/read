@@ -9,17 +9,19 @@ REM      no C compiler or CRT is invoked, the .exe has zero CRT dependency)
 REM   Pick the "i686" / "Win32" build from winlibs.com, NOT the x86_64 one,
 REM   since this assembles a 32-bit executable.
 
-nasm -f win32 -Isrc\ src\read_win.asm -o read_win.o
+if not exist output mkdir output
+
+nasm -f win32 -Isrc\ src\read_win.asm -o output\read_win.o
 if %ERRORLEVEL% NEQ 0 (
     echo Assemble failed
     exit /b 1
 )
 
-ld -e _start --subsystem windows -o read.exe read_win.o -lkernel32 -luser32 -lgdi32
+ld -e _start --subsystem windows -o output\read.exe output\read_win.o -lkernel32 -luser32 -lgdi32
 if %ERRORLEVEL% NEQ 0 (
     echo Link failed
     exit /b 1
 )
 
-strip read.exe
-echo Built read.exe
+strip output\read.exe
+echo Built output\read.exe

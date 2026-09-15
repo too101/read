@@ -5,5 +5,6 @@
 # Arch:          sudo pacman -S base-devel libx11 libxext
 
 set -e
-gcc -O2 -Wall -Wextra -o read src/read_linux.c -lX11 -lXext
-echo "Built ./read"
+mkdir -p output
+gcc -O2 -Wall -Wextra -o output/read src/read_linux.c -lX11 -lXext
+echo "Built ./output/read"
