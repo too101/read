@@ -117,7 +117,20 @@ static void linetab_push(LineTab *t, const unsigned char *ptr, int len) {
  * see read.asm's bl_sp for why style bytes must not count: a line of N
  * visible columns must not report width > N just because it also carries
  * style-toggle bytes). Caps a single line's counted width at 255, same as
- * the DOS build (a purely cosmetic cap -- doesn't affect what's stored). */
+ * the DOS build (a purely cosmetic cap -- doesn't affect what's stored).
+ *
+ * Classifies the RAW byte, not translate()'s KU-translated one, even in
+ * KU mode -- this matches read.asm's bl_c, which indexes its class table
+ * ([cls+bx]) with AL straight from the file with no KU translation at all
+ * (translation only happens later, in the "read next byte for drawing"
+ * path/RDCH's trc table). So on a KU-encoded file, maxlen here can come
+ * out larger than a "translate first" count would give, since a raw KU
+ * combining-mark byte usually doesn't fall in TIS-620's D1h-EEh combining
+ * range and so gets counted as a full base column instead of 0 -- that's
+ * a real quirk of the original program (confirmed: DOS reaches a higher
+ * max hshift than a "corrected" translate-first count would allow), not
+ * a bug to fix, and this port must reproduce it to match DOS's actual
+ * scroll limit rather than a mathematically "nicer" one of its own. */
 static void build_lines(LineTab *t, const unsigned char *buf, int len) {
     linetab_free(t);
     int line_start = 0;
@@ -125,8 +138,7 @@ static void build_lines(LineTab *t, const unsigned char *buf, int len) {
     int i = 0;
     while (i < len) {
         unsigned char raw = buf[i];
-        unsigned char tb = translate(raw);
-        unsigned char cls = classify(tb);
+        unsigned char cls = classify(raw);
         if (cls & C_TERM) {
             linetab_push(t, buf + line_start, i - line_start);
             if (col > t->maxlen) t->maxlen = col;

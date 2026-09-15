@@ -405,8 +405,16 @@ build_lines:
     add eax, [ebp-12]
     movzx eax, byte [eax]
     mov [ebp-16], eax          ; raw
-    CALL1 translate, dword [ebp-16]
-    CALL1 classify, eax
+    ; classify the RAW byte, not translate()'s KU-translated one -- matches
+    ; read.asm's bl_c, which indexes its class table with AL straight from
+    ; the file with no KU translation at all (that only happens later, in
+    ; the draw-time RDCH/trc path). On a KU file this can make maxlen come
+    ; out larger than a "translate first" count would (a raw KU combining
+    ; mark usually isn't in TIS-620's D1h-EEh range, so it counts as a full
+    ; column instead of 0) -- confirmed against real DOS: that's the actual
+    ; original scroll limit, not a bug, so this must match it rather than
+    ; compute a "nicer" one of its own.
+    CALL1 classify, dword [ebp-16]
     test eax, C_TERM
     jz .bl_not_term
     ; linetab_push(t, buf+line_start, i-line_start)
