@@ -1,0 +1,18 @@
+# Build artifacts (all regenerable from source via each port's build script)
+dos/output/
+dos/packed.bin
+dos/packed.inc
+
+windows/read.exe
+windows/src/data.inc
+
+linux/read
+linux/src/data.h
+
+# Object files / misc
+*.o
+*.obj
+
+# Python caches from the dev-time HELP-text scripts
+__pycache__/
+*.pyc
