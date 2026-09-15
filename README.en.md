@@ -1,12 +1,12 @@
-# read — a Thai-language text reader (TIS-620)
+# READ — a Thai-language text reader (TIS-620)
 
 *[อ่านเป็นภาษาไทย](README.md)*
 
 A full-screen text viewer for Thai-language text files. Supports TIS-620
 encoding, combining-mark composition of vowels/tone marks over base
 consonants, and WordStar-style inline character attributes (bold, italic,
-underline, etc.). Originally written years ago as pure x86 assembly for
-DOS, later ported to Windows and Linux while keeping the core logic (byte
+underline, etc.). Originally written as pure x86 assembly for DOS, later
+ported to Windows and Linux while keeping the core logic (byte
 classification, KU/TIS code conversion, glyph composition) identical —
 only the platform windowing layer differs.
 
