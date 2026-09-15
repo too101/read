@@ -697,7 +697,8 @@ int main(int argc, char **argv) {
     Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wm_delete, 1);
 
-    XSelectInput(dpy, win, ExposureMask | KeyPressMask | StructureNotifyMask);
+    XSelectInput(dpy, win, ExposureMask | KeyPressMask | StructureNotifyMask
+                            | VisibilityChangeMask);
     XMapWindow(dpy, win);
 
     GC gc = XCreateGC(dpy, win, 0, NULL);
@@ -731,6 +732,19 @@ int main(int argc, char **argv) {
         XNextEvent(dpy, &ev);
         switch (ev.type) {
         case Expose:
+            put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
+            break;
+        case VisibilityNotify:
+            /* Safety net for state changes (maximize being the main one)
+             * that some window managers/compositors don't reliably follow
+             * up with an Expose for -- reported symptom: after clicking
+             * Maximize the window goes blank and stays that way until some
+             * unrelated later redraw (e.g. scrolling) happens to paint it.
+             * g_px already holds the fully-correct current content (it was
+             * repainted synchronously in the ConfigureNotify case above,
+             * same code path as any other resize), so this just re-sends
+             * it -- cheap, and VisibilityNotify doesn't fire often enough
+             * for the redundant repaint to matter. */
             put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
             break;
         case ConfigureNotify: {
