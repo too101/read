@@ -530,6 +530,60 @@ static int apply_key(KeySym ks, int *running) {
     return redraw;
 }
 
+/* Fast path for the single most common redraw: scrolling by exactly one
+ * line (an Up/Down keypress, or key-repeat that coalesced down to a net
+ * ±1). render_all() + a full-window XPutImage() recomputes and re-sends
+ * every pixel even though only the status bar's R:x-y counter and one
+ * newly-exposed body line actually changed -- fine on a local X11
+ * display, but over a forwarded display pipe such as WSLg (Xwayland ->
+ * Weston -> RDP to the Windows host) every full-window blit has real
+ * transport cost, and this is the operation that fires over and over
+ * while someone holds an arrow key to read. So instead: shift the
+ * *already-displayed* body pixels with XCopyArea (a server-side copy --
+ * next to no data crosses the wire for it), mirror the same shift into
+ * our own g_px with memmove (plain local memory, not network traffic),
+ * then draw and send only the two small rectangles that are genuinely
+ * new: the status bar and the one line that scrolled into view.
+ *
+ * `direction` is +1 (scrolled down, new line appears at the bottom) or
+ * -1 (scrolled up, new line appears at the top). Precondition, checked
+ * by the caller: g_top has already moved by exactly one line in that
+ * direction and nothing else about the display state changed (hshift,
+ * help mode, KU mode, which table is current) -- any of those touch
+ * every column or every glyph, so they still go through the full
+ * render_all() path. */
+static void scroll_redraw_fast(Display *dpy, Window win, GC gc, XImage *ximg, int direction) {
+    int body_y0  = CELLH;                 /* body starts below the status bar */
+    int body_h   = g_body * CELLH;
+    int shift_h  = body_h - CELLH;        /* rows that just slide, unchanged */
+
+    if (shift_h > 0) {
+        if (direction > 0) {
+            memmove(g_px + (size_t)body_y0 * g_win_w,
+                    g_px + (size_t)(body_y0 + CELLH) * g_win_w,
+                    (size_t)shift_h * g_win_w * sizeof(*g_px));
+            XCopyArea(dpy, win, win, gc, 0, body_y0 + CELLH, g_win_w, shift_h, 0, body_y0);
+        } else {
+            memmove(g_px + (size_t)(body_y0 + CELLH) * g_win_w,
+                    g_px + (size_t)body_y0 * g_win_w,
+                    (size_t)shift_h * g_win_w * sizeof(*g_px));
+            XCopyArea(dpy, win, win, gc, 0, body_y0, g_win_w, shift_h, 0, body_y0 + CELLH);
+        }
+    }
+
+    int new_row_y  = (direction > 0) ? (body_y0 + shift_h) : body_y0;
+    int new_row_li = (direction > 0) ? (g_top + g_body - 1) : g_top;
+    for (int y = new_row_y; y < new_row_y + CELLH; y++)
+        for (int x = 0; x < g_win_w; x++) g_px[(size_t)y * g_win_w + x] = COL_BG;
+    if (new_row_li >= 0 && new_row_li < g_cur->nlines)
+        draw_line(new_row_y, g_cur->lines[new_row_li].ptr, g_cur->lines[new_row_li].len);
+
+    draw_status();  /* R:x-y counter always changes on scroll */
+
+    XPutImage(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, CELLH);                  /* status bar */
+    XPutImage(dpy, win, gc, ximg, 0, new_row_y, 0, new_row_y, g_win_w, CELLH);  /* new line */
+}
+
 int main(int argc, char **argv) {
     fb_create();
     if (!g_px) { fprintf(stderr, "out of memory\n"); return 1; }
@@ -563,6 +617,10 @@ int main(int argc, char **argv) {
     XMapWindow(dpy, win);
 
     GC gc = XCreateGC(dpy, win, 0, NULL);
+    XSetGraphicsExposures(dpy, gc, False); /* scroll_redraw_fast's XCopyArea
+        copies window-to-window on purpose (fast-scroll below) -- we always
+        know exactly what we just drew there, so we don't need the server's
+        GraphicsExpose/NoExpose bookkeeping for it */
     Visual *visual = DefaultVisual(dpy, screen);
     int depth = DefaultDepth(dpy, screen);
     XImage *ximg = XCreateImage(dpy, visual, (unsigned)depth, ZPixmap, 0,
@@ -622,6 +680,9 @@ int main(int argc, char **argv) {
             break;
         case KeyPress: {
             KeySym ks = XLookupKeysym(&ev.xkey, 0);
+            int old_top = g_top, old_hshift = g_hshift;
+            int old_help_mode = g_help_mode, old_ku_mode = g_ku_mode;
+            LineTab *old_cur = g_cur;
             int redraw = apply_key(ks, &running);
             /* Key-repeat from holding an arrow/PgDn/etc down (or just fast
              * key-mashing) can queue up several KeyPress events before we
@@ -637,8 +698,17 @@ int main(int argc, char **argv) {
                 if (apply_key(ks2, &running)) redraw = 1;
             }
             if (redraw && running) {
-                render_all();
-                XPutImage(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
+                int dtop = g_top - old_top;
+                if (g_hshift == old_hshift && g_help_mode == old_help_mode &&
+                    g_ku_mode == old_ku_mode && g_cur == old_cur &&
+                    (dtop == 1 || dtop == -1)) {
+                    /* the common case: plain single-line scroll, nothing
+                       else changed -- see scroll_redraw_fast's comment */
+                    scroll_redraw_fast(dpy, win, gc, ximg, dtop);
+                } else {
+                    render_all();
+                    XPutImage(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
+                }
             }
             break;
         }
