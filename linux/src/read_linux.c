@@ -6,7 +6,8 @@
  * framebuffer-blit layer differs (X11 here, GDI there) and the file/arg
  * handling uses plain POSIX instead of Win32 calls. Everything hardware-
  * specific to DOS/BIOS/CGA-EGA-VGA-Hercules is replaced with a single
- * resizable window (80x24 at startup), same as the Windows port -- no
+ * resizable window (80x25 at startup -- 1 status row + 24 body rows, same
+ * screen size as DOS's own VGA text mode), same as the Windows port -- no
  * video-mode selection needed.
  *
  * Assumes a TrueColor display with 24 or 32-bit depth (virtually
@@ -16,7 +17,7 @@
  * quirks between depths/visuals never show up as wrong colors.
  *
  * The window is resizable: COLS/BODY/WIN_W/WIN_H used to be fixed at
- * 80x24, now they're runtime state (g_cols/g_body/g_win_w/g_win_h) updated
+ * 80x25, now they're runtime state (g_cols/g_body/g_win_w/g_win_h) updated
  * from ConfigureNotify -- see main()'s event loop and fb_create(). The
  * bitmap font stays 8x19 always (resizing reveals more/fewer whole cells,
  * never scales the glyphs).
@@ -669,8 +670,19 @@ static int apply_key(KeySym ks, int *running) {
             recompute_bounds(&g_tab);
         }
         break;
-    case XK_Escape:    *running = 0; redraw = 0; break;
-    case XK_q: case XK_Q: *running = 0; redraw = 0; break;
+    case XK_Escape:
+    case XK_q: case XK_Q:
+        /* like read.asm's v_ascii: while viewing help, Esc/Q are ordinary
+           keys too -- they dismiss help back to the file (or quit in demo
+           mode with no file), same as any other key below, NOT a direct
+           quit. Only outside help mode do they quit the program. */
+        if (g_help_mode) {
+            if (g_filebuf) exit_help();
+            else { *running = 0; redraw = 0; }
+        } else {
+            *running = 0; redraw = 0;
+        }
+        break;
     default:
         /* like read.asm's help view: any other key dismisses help --
            back to the file if one is loaded, or quits in demo mode */
@@ -739,6 +751,17 @@ static void scroll_redraw_fast(Display *dpy, Window win, GC gc, XImage *ximg, in
     put_image(dpy, win, gc, ximg, 0, new_row_y, 0, new_row_y, g_win_w, CELLH);  /* new line */
 }
 
+/* Sets *due to `delay_ms` from now (CLOCK_MONOTONIC) -- see the
+ * repaint_pending/repaint_due comment in main() for what this arms. */
+static void repaint_deadline(struct timespec *due, long delay_ms) {
+    clock_gettime(CLOCK_MONOTONIC, due);
+    due->tv_nsec += delay_ms * 1000000L;
+    if (due->tv_nsec >= 1000000000L) {
+        due->tv_sec += due->tv_nsec / 1000000000L;
+        due->tv_nsec %= 1000000000L;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2) load_file(argv[1]);
     if (!g_filebuf) enter_help(); /* no file given -> show help, like the DOS demo mode */
@@ -796,29 +819,31 @@ int main(int argc, char **argv) {
 
     int running = 1;
     XEvent ev;
-    /* Follow-up repaint timer, armed after a resize/maximize (see the
-     * ConfigureNotify case below). Reported symptom on WSLg: after clicking
-     * Maximize the window goes solid black and stays that way until some
-     * unrelated later event (moving the mouse) happens to trigger a
-     * repaint -- even though we already sent the correct pixels via
-     * put_image() right after handling the resize, same as any other
-     * resize. That points at the compositor side (Weston, in WSLg's
-     * Xwayland -> Weston -> RDP-to-Windows-host pipeline) occasionally
-     * losing or mis-timing the damage from that specific blit during the
-     * maximize transition, not at anything wrong with what we drew or
-     * sent -- VisibilityNotify (below) was added as one safety net for
-     * this and reportedly didn't fix it either. A plain mouse move isn't
-     * an event this program reacts to at all, so "moving the mouse fixes
-     * it" isn't this program picking up some event we'd missed -- it's
-     * the Windows-side compositor's own damage/redraw logic getting
-     * kicked by something unrelated to X11. We can't make the compositor
-     * behave from here, but we can hedge against losing that one blit: a
-     * harmless extra full-window repaint a moment after every resize,
-     * timed independently of X11 events (a plain wall-clock deadline, via
+    /* Follow-up repaint timer, armed after this first paint and again after
+     * every resize/maximize (see the ConfigureNotify case below). Reported
+     * symptom on WSLg: the window goes solid black -- at plain startup, or
+     * after clicking Maximize -- and stays that way until some unrelated
+     * later event (moving the mouse) happens to trigger a repaint, even
+     * though we already sent the correct pixels via put_image() right
+     * there (same code either way: the first-frame paint just above, or
+     * the resize one below). That points at the compositor side (Weston,
+     * in WSLg's Xwayland -> Weston -> RDP-to-Windows-host pipeline)
+     * occasionally losing or mis-timing the damage from that specific
+     * blit, not at anything wrong with what we drew or sent --
+     * VisibilityNotify (below) was added as one safety net for the
+     * maximize case and reportedly didn't fix it either. A plain mouse
+     * move isn't an event this program reacts to at all, so "moving the
+     * mouse fixes it" isn't this program picking up some event we'd
+     * missed -- it's the Windows-side compositor's own damage/redraw logic
+     * getting kicked by something unrelated to X11. We can't make the
+     * compositor behave from here, but we can hedge against losing that
+     * one blit: a harmless extra full-window repaint a moment later, timed
+     * independently of X11 events (a plain wall-clock deadline, via
      * select() on the X connection's file descriptor) so it fires even if
      * no further X event ever arrives to drive the loop around again. */
-    int repaint_pending = 0;
+    int repaint_pending = 1;
     struct timespec repaint_due;
+    repaint_deadline(&repaint_due, 200);
     while (running) {
         if (repaint_pending && !XPending(dpy)) {
             struct timespec now;
@@ -898,12 +923,7 @@ int main(int argc, char **argv) {
             put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
             /* arm the follow-up repaint (see its declaration above) */
             repaint_pending = 1;
-            clock_gettime(CLOCK_MONOTONIC, &repaint_due);
-            repaint_due.tv_nsec += 200000000L; /* +200ms */
-            if (repaint_due.tv_nsec >= 1000000000L) {
-                repaint_due.tv_sec += 1;
-                repaint_due.tv_nsec -= 1000000000L;
-            }
+            repaint_deadline(&repaint_due, 200);
             break;
         }
         case ClientMessage:

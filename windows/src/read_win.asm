@@ -200,7 +200,7 @@ stx:
     db 0,0,0x0C,0x08,0x20,0x40,0x10,0x40
 
 class_name_str:  db "READWINCLASS",0
-title_str:       db "READ.COM for Windows",0
+title_str:       db "READ for Windows",0
 help_title_str:  db "READ.COM Help",0
 nofile_str:      db "(no file)",0
 ku_str:          db "KU",0
@@ -1667,12 +1667,24 @@ WndProc:
 .k12:
     cmp dword [ebp+16], 0x1B          ; VK_ESCAPE
     jne .k13
-    CALL1 _PostQuitMessage@4, 0
-    mov dword [ebp-68], 0
-    jmp .k_done
+    jmp .k_esc_or_q
 .k13:
     cmp dword [ebp+16], 'Q'
     jne .k_default
+    ; fall through to .k_esc_or_q
+.k_esc_or_q:
+    ; like read.asm's v_ascii: while viewing help, Esc/Q are ordinary keys
+    ; too -- they dismiss help back to the file (or quit in demo mode with
+    ; no file), same as any other key below (.k_default), NOT a direct
+    ; quit. Only outside help mode do they quit the program.
+    cmp dword [g_help_mode], 0
+    je .k_esc_or_q_quit
+    mov eax, [g_filebuf]
+    test eax, eax
+    jz .k_esc_or_q_quit
+    call exit_help
+    jmp .k_done
+.k_esc_or_q_quit:
     CALL1 _PostQuitMessage@4, 0
     mov dword [ebp-68], 0
     jmp .k_done
