@@ -1,0 +1,84 @@
+name: build-and-sign-windows
+
+# Builds windows/read.exe on a GitHub-hosted Windows runner and, once the
+# SignPath secrets below exist, submits it to SignPath for code signing.
+#
+# --- one-time setup needed before this workflow can sign anything ---
+# 1. Get approved by SignPath Foundation (https://signpath.org) for free
+#    OSS code signing -- requires an OSI-approved license (done: see
+#    ../../LICENSE) and a published code-signing policy.
+# 2. In the SignPath dashboard, create a project (e.g. slug "read") with
+#    an artifact configuration (e.g. slug "read-exe") and signing
+#    policies (e.g. "release-signing" for the main branch, "test-signing"
+#    for everything else). Update the slugs below to match whatever you
+#    actually name them.
+# 3. In this repo's Settings -> Secrets and variables -> Actions, add:
+#      - secret   SIGNPATH_API_TOKEN
+#      - variable SIGNPATH_ORGANIZATION_ID
+# Until step 3 is done, the "Submit signing request" step below will fail
+# -- that's expected. The build step above it can still be tested on its
+# own via the "Run workflow" button (workflow_dispatch).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'windows/**'
+      - '.github/workflows/build-and-sign-windows.yml'
+  workflow_dispatch: {}
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NASM
+        run: choco install nasm -y --no-progress
+
+      # Only ld.exe + import libs from this are used below -- no C compiler
+      # or CRT is invoked (read.exe has zero CRT dependency, see
+      # windows/build.bat for why a 32-bit/i686 toolchain specifically).
+      - name: Install MinGW-w64 (i686)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Pinned winlibs.com i686/Win32 release -- if this 404s, grab a
+          # current "i686 ... Win32" zip URL from
+          # https://github.com/brechtsanders/winlibs_mingw/releases and
+          # update the line below.
+          $url = "https://github.com/brechtsanders/winlibs_mingw/releases/download/13.2.0posix-17.0.6-11.0.1-ucrt-r1/winlibs-i686-posix-dwarf-gcc-13.2.0-mingw-w64ucrt-11.0.1-r1.zip"
+          Invoke-WebRequest -Uri $url -OutFile mingw.zip
+          Expand-Archive mingw.zip -DestinationPath C:\mingw-i686
+          echo "C:\mingw-i686\mingw32\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build read.exe
+        working-directory: windows
+        shell: cmd
+        run: build.bat
+
+      - name: Upload unsigned artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-exe-unsigned
+          path: windows/output/read.exe
+
+      - name: Submit signing request
+        id: sign
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ vars.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: 'read'
+          signing-policy-slug: ${{ github.ref == 'refs/heads/main' && 'release-signing' || 'test-signing' }}
+          artifact-configuration-slug: 'read-exe'
+          github-artifact-id: '${{ steps.upload.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'windows/output/signed'
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-exe-signed
+          path: windows/output/signed/read.exe
