@@ -1,0 +1,23 @@
+# Normalize line endings for ordinary text/source files: always stored as
+# LF in the repo no matter what OS/editor touched them, checked out as LF
+# too (eol=lf, not "native") so nothing differs between platforms. This is
+# what silences Git for Windows' default core.autocrlf=true warnings like
+# "LF will be replaced by CRLF the next time Git touches it".
+* text=auto eol=lf
+
+# Windows batch scripts: keep CRLF, the traditional/safe ending for cmd.exe.
+*.bat text eol=crlf
+
+# dos/*.INC already ship with CRLF line endings in this repo (NASM doesn't
+# care either way) -- leave them exactly as-is instead of rewriting their
+# line endings as a side effect of adding this file.
+dos/KU.INC -text
+dos/STATUS.INC -text
+dos/STRS.INC -text
+
+# Binary assets: never touch, never line-ending-convert, never diff as text.
+*.FON binary
+*.png binary
+dos/HELP.TXT binary
+linux/HELP_LINUX.TXT binary
+windows/HELP_WIN.TXT binary
