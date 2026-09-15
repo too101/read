@@ -627,6 +627,19 @@ int main(int argc, char **argv) {
                                  (char*)g_px, g_win_w, g_win_h, 32, 0);
 
     render_all();
+    /* Paint the first frame right now instead of waiting for the window
+     * manager/compositor to deliver an Expose event for it. Relying on
+     * Expose alone means the window can sit showing just its plain
+     * XCreateSimpleWindow background (solid black) for however long the
+     * compositor takes to get around to damaging/exposing it -- under a
+     * compositing environment like WSLg (which can animate the window in
+     * and/or deliver Expose for sub-regions as it does) that shows up as
+     * "window appears, content pops in a moment later" or even "content
+     * appears half first, then the rest" if only part of it gets
+     * (re)painted before the next Expose arrives. Any Expose that does
+     * still show up afterward just repeats this same full-window
+     * XPutImage, which is harmless. */
+    XPutImage(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
 
     int running = 1;
     XEvent ev;
