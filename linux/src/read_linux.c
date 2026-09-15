@@ -26,6 +26,9 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/extensions/XShm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -207,13 +210,97 @@ static void detect_ku(const unsigned char *buf, int len) {
 /* ---------------- framebuffer (plain array, blitted via XImage) --------- */
 static unsigned int *g_px = NULL; /* g_win_w x g_win_h, top-down 0x00RRGGBB */
 
-/* Allocates a fresh buffer sized to the CURRENT g_win_w/g_win_h. Called once
- * at startup and again on every resize -- the caller (main()'s event loop)
- * is responsible for destroying the old XImage first (XDestroyImage frees
- * the buffer it wraps, since it took ownership of the pointer it was
- * created with) so recreating doesn't leak. */
-static void fb_create(void) {
+/* Whether the current framebuffer is backed by an MIT-SHM segment (1) or a
+ * plain malloc'd buffer (0) -- decided fresh each fb_create() call, since
+ * whether the extension is usable can only be known once a Display is
+ * open. put_image() below picks XShmPutImage vs XPutImage based on this. */
+static int g_use_shm = 0;
+static XShmSegmentInfo g_shminfo;
+
+/* Creates a fresh framebuffer + its backing XImage, sized to the CURRENT
+ * g_win_w/g_win_h. Prefers the MIT-SHM extension: with it, the shared-
+ * memory segment *is* g_px, so a later XShmPutImage has the X server read
+ * pixels straight out of it instead of the client copying the whole image
+ * into the X protocol request -- worth doing for the full-window blits
+ * this program still can't avoid (a full-page PgUp/PgDn jump, a resize,
+ * the first frame) especially over a forwarded display pipe like WSLg.
+ * Falls back to a plain malloc'd buffer + XCreateImage if the extension
+ * isn't available or any setup step fails, so this always succeeds one
+ * way or the other (short of real out-of-memory, signaled the same way
+ * as before: g_px left NULL).
+ *
+ * Called once at startup and again on every resize; the caller is
+ * responsible for destroying the previous XImage first via
+ * fb_destroy_image(), not XDestroyImage directly (SHM cleanup needs more
+ * than that). */
+static XImage *fb_create(Display *dpy, Visual *visual, int depth) {
+    if (XShmQueryExtension(dpy)) {
+        XImage *img = XShmCreateImage(dpy, visual, (unsigned)depth, ZPixmap,
+                                       NULL, &g_shminfo,
+                                       (unsigned)g_win_w, (unsigned)g_win_h);
+        if (img) {
+            size_t bytes = (size_t)img->bytes_per_line * (size_t)img->height;
+            g_shminfo.shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0600);
+            if (g_shminfo.shmid != -1) {
+                g_shminfo.shmaddr = img->data = (char*)shmat(g_shminfo.shmid, NULL, 0);
+                if (g_shminfo.shmaddr != (char*)-1) {
+                    g_shminfo.readOnly = False;
+                    if (XShmAttach(dpy, &g_shminfo)) {
+                        XSync(dpy, False); /* the server's attach must land
+                                               before we ever PutImage */
+                        /* mark for removal now -- the segment still lives
+                           until every attached process (us, and the X
+                           server) detaches, but this way it can never leak
+                           even if we exit before reaching cleanup */
+                        shmctl(g_shminfo.shmid, IPC_RMID, NULL);
+                        g_use_shm = 1;
+                        g_px = (unsigned int*)img->data;
+                        return img;
+                    }
+                    shmdt(g_shminfo.shmaddr);
+                }
+                shmctl(g_shminfo.shmid, IPC_RMID, NULL);
+            }
+            XDestroyImage(img); /* data was never attached (or setup failed
+                                    partway) -- safe to let this free it */
+        }
+    }
+    g_use_shm = 0;
     g_px = (unsigned int*)malloc((size_t)g_win_w * g_win_h * sizeof(unsigned int));
+    if (!g_px) return NULL;
+    return XCreateImage(dpy, visual, (unsigned)depth, ZPixmap, 0,
+                         (char*)g_px, g_win_w, g_win_h, 32, 0);
+}
+
+static void fb_destroy_image(Display *dpy, XImage *img) {
+    if (g_use_shm) {
+        XShmDetach(dpy, &g_shminfo);
+        XDestroyImage(img);   /* frees the XImage struct only -- the pixel
+                                  data is the shm segment, detached above */
+        shmdt(g_shminfo.shmaddr);
+        g_use_shm = 0;
+    } else {
+        XDestroyImage(img);   /* frees g_px too -- it owns that pointer */
+    }
+}
+
+/* XPutImage/XShmPutImage, picking whichever matches how the current
+ * framebuffer is backed. The Shm path passes send_event=False and follows
+ * up with XSync(): we don't track completion events, so the simplest
+ * correct rule is "don't touch g_px again until the server has definitely
+ * finished reading this segment", and XSync's round trip is cheap (it's
+ * local IPC to the X server, not the WSLg forwarding hop) next to the
+ * bulk pixel copy it replaces. */
+static void put_image(Display *dpy, Window win, GC gc, XImage *img,
+                       int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
+    if (g_use_shm) {
+        XShmPutImage(dpy, win, gc, img, src_x, src_y, dst_x, dst_y,
+                     (unsigned)w, (unsigned)h, False);
+        XSync(dpy, False);
+    } else {
+        XPutImage(dpy, win, gc, img, src_x, src_y, dst_x, dst_y,
+                  (unsigned)w, (unsigned)h);
+    }
 }
 
 #define COL_BG      0x00101010u
@@ -580,14 +667,11 @@ static void scroll_redraw_fast(Display *dpy, Window win, GC gc, XImage *ximg, in
 
     draw_status();  /* R:x-y counter always changes on scroll */
 
-    XPutImage(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, CELLH);                  /* status bar */
-    XPutImage(dpy, win, gc, ximg, 0, new_row_y, 0, new_row_y, g_win_w, CELLH);  /* new line */
+    put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, CELLH);                  /* status bar */
+    put_image(dpy, win, gc, ximg, 0, new_row_y, 0, new_row_y, g_win_w, CELLH);  /* new line */
 }
 
 int main(int argc, char **argv) {
-    fb_create();
-    if (!g_px) { fprintf(stderr, "out of memory\n"); return 1; }
-
     if (argc >= 2) load_file(argv[1]);
     if (!g_filebuf) enter_help(); /* no file given -> show help, like the DOS demo mode */
     else { g_cur = &g_tab; }
@@ -623,8 +707,8 @@ int main(int argc, char **argv) {
         GraphicsExpose/NoExpose bookkeeping for it */
     Visual *visual = DefaultVisual(dpy, screen);
     int depth = DefaultDepth(dpy, screen);
-    XImage *ximg = XCreateImage(dpy, visual, (unsigned)depth, ZPixmap, 0,
-                                 (char*)g_px, g_win_w, g_win_h, 32, 0);
+    XImage *ximg = fb_create(dpy, visual, depth);
+    if (!g_px) { fprintf(stderr, "out of memory\n"); return 1; }
 
     render_all();
     /* Paint the first frame right now instead of waiting for the window
@@ -639,7 +723,7 @@ int main(int argc, char **argv) {
      * (re)painted before the next Expose arrives. Any Expose that does
      * still show up afterward just repeats this same full-window
      * XPutImage, which is harmless. */
-    XPutImage(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
+    put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
 
     int running = 1;
     XEvent ev;
@@ -647,7 +731,7 @@ int main(int argc, char **argv) {
         XNextEvent(dpy, &ev);
         switch (ev.type) {
         case Expose:
-            XPutImage(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
+            put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
             break;
         case ConfigureNotify: {
             int new_w = ev.xconfigure.width, new_h = ev.xconfigure.height;
@@ -678,14 +762,12 @@ int main(int argc, char **argv) {
             if (new_body < MIN_BODY) new_body = MIN_BODY;
             g_win_w = new_w; g_win_h = new_h;
             g_cols = new_cols; g_body = new_body;
-            XDestroyImage(ximg);   /* frees the old g_px it owns */
-            fb_create();
+            fb_destroy_image(dpy, ximg);
+            ximg = fb_create(dpy, visual, depth);
             if (!g_px) { fprintf(stderr, "out of memory\n"); running = 0; break; }
-            ximg = XCreateImage(dpy, visual, (unsigned)depth, ZPixmap, 0,
-                                 (char*)g_px, g_win_w, g_win_h, 32, 0);
             recompute_bounds(g_cur);  /* NOT calc_limits -- keep scroll pos */
             render_all();
-            XPutImage(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
+            put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
             break;
         }
         case ClientMessage:
@@ -720,7 +802,7 @@ int main(int argc, char **argv) {
                     scroll_redraw_fast(dpy, win, gc, ximg, dtop);
                 } else {
                     render_all();
-                    XPutImage(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
+                    put_image(dpy, win, gc, ximg, 0, 0, 0, 0, g_win_w, g_win_h);
                 }
             }
             break;
@@ -728,7 +810,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    XDestroyImage(ximg); /* also frees g_px -- it owns the buffer now */
+    fb_destroy_image(dpy, ximg);
     XFreeGC(dpy, gc);
     XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);

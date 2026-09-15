@@ -19,12 +19,12 @@ headless ด้วย Xvfb + `xdotool` + ImageMagick `import`): เปิดไ�
 
 ## Build
 
-ต้องมี GCC และ libX11 dev headers:
+ต้องมี GCC, libX11 และ libXext (สำหรับส่วนขยาย MIT-SHM) dev headers:
 
 ```
-sudo apt install build-essential libx11-dev   # Debian/Ubuntu
-sudo dnf install gcc libX11-devel             # Fedora
-sudo pacman -S base-devel libx11              # Arch
+sudo apt install build-essential libx11-dev libxext-dev   # Debian/Ubuntu
+sudo dnf install gcc libX11-devel libXext-devel           # Fedora
+sudo pacman -S base-devel libx11 libxext                  # Arch
 ```
 
 แล้วรัน:
@@ -36,8 +36,11 @@ sudo pacman -S base-devel libx11              # Arch
 หรือสั่งตรง ๆ:
 
 ```
-gcc -O2 -o read src/read_linux.c -lX11
+gcc -O2 -o read src/read_linux.c -lX11 -lXext
 ```
+
+(ถ้า X server ปลายทางไม่มีส่วนขยาย MIT-SHM โปรแกรมจะ fallback ไปใช้วิธีส่ง
+ภาพแบบเดิมอัตโนมัติ ไม่ crash — ดูหัวข้อ "ประสิทธิภาพ" ด้านล่าง)
 
 ## วิธีใช้ / ปุ่มควบคุม
 
@@ -81,6 +84,18 @@ X11 บนเครื่องเดียวกันตรง ๆ) — ผล
 อะไรอื่นเปลี่ยน (ไม่ใช่ PgUp/PgDn/Home/End ที่กระโดดหลายบรรทัด ไม่ใช่ตอน
 สลับโหมด KU/TIS หรือ help ซึ่งเปลี่ยนทุกตัวอักษร) กรณีอื่นนอกจากนี้ยังคง
 redraw ทั้งจอตามปกติ ซึ่งถูกต้องอยู่แล้วและไม่บ่อยเท่า
+
+**กรณีที่ยังต้อง redraw ทั้งจอ** (PgUp/PgDn ที่กระโดดข้ามไปทั้งหน้าไม่มี
+บรรทัดไหนซ้ำกับหน้าเดิมเลย, resize, เปิดโปรแกรม) ใช้ส่วนขยาย **MIT-SHM**
+ของ X11 ถ้า X server รองรับ (ปกติรองรับแทบทุกที่ รวมถึง WSLg): แทนที่จะให้
+ไคลเอนต์ copy ข้อมูลภาพทั้งก้อนใส่ X protocol request ทุกครั้ง จะสร้าง
+framebuffer เป็น shared-memory segment ที่ X server อ่านพิกเซลออกไปได้
+โดยตรง ตัดการ copy ข้อมูลซ้ำซ้อนฝั่งไคลเอนต์ออกไป — ถ้า X server ไม่รองรับ
+ส่วนขยายนี้ (ตรวจตอนเปิดโปรแกรมครั้งเดียว) จะ fallback ไปใช้การส่งภาพแบบ
+`XPutImage` ปกติอัตโนมัติ ไม่มีผลต่อพฤติกรรมหรือความถูกต้องของภาพที่แสดง
+เลย (ยืนยันด้วย pixel-diff เทียบทั้งสองโหมดแล้วว่าเหมือนกัน 100% รวมถึง
+ตรวจสอบว่า shared-memory segment ถูกเก็บกวาดไม่รั่วไหลทั้งตอน resize และ
+ตอนปิดโปรแกรมด้วย `ipcs -m`)
 
 **ตอนเปิดโปรแกรม** เนื้อหาแรกจะถูกส่งไปวาดทันทีหลังสร้างหน้าต่างเสร็จ
 ไม่รอ X11 event `Expose` (ซึ่งบางสภาพแวดล้อมที่มี compositor เช่น WSLg
